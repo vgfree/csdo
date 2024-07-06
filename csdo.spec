@@ -49,7 +49,7 @@ rm -f /usr/sbin/csdod
 fi
 
 %files
-%defattr(0777,root,root,-)
+%defattr(0755,root,root,-)
 /usr/bin/csdo
 /usr/sbin/csdod
 %{_unitdir}/csdod.service
