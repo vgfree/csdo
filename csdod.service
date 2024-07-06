@@ -1,0 +1,18 @@
+[Unit]
+Description=An command performer
+After=syslog.target
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/sbin/csdod
+Restart=always
+RestartSec=5
+
+ReadWritePaths=/var/lib/csdod /var/run/csdod
+RuntimeDirectory=csdod
+
+[Install]
+WantedBy=multi-user.target
