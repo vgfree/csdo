@@ -22,6 +22,7 @@
 #include <signal.h>
 #include <poll.h>
 #include <sys/wait.h>
+#include <pthread.h>
 
 #include "utils.h"
 /*
@@ -338,7 +339,7 @@ static void csdo_got_cb(void *private, void *data, uint64_t size, int std_fileno
 	do_write(fd, data, size);
 }
 
-static void csdo_query_handle(int fd, char *cmd, uint64_t len)
+static void do_query_work(int fd, char *cmd, uint64_t len)
 {
 	struct cmd_arg_list list = {};
 	cmd_decode(&list, cmd, len);
@@ -355,60 +356,71 @@ static void csdo_query_handle(int fd, char *cmd, uint64_t len)
 	do_write(fd, &rph, sizeof(rph));
 }
 
+static void *csdo_query_handle(void *arg)
+{
+        int fd = (int)(uintptr_t)arg;
+	struct csdo_request_header rqh;
+	char *extra = NULL;
+
+	int rv = do_read(fd, &rqh, sizeof(rqh));
+	if (rv < 0) {
+		goto out;
+	}
+
+	if (rqh.bh.magic != CSDO_QUERY_MAGIC) {
+		goto out;
+	}
+
+	if ((rqh.bh.version & 0xFFFF0000) != (CSDO_QUERY_VERSION & 0xFFFF0000)) {
+		goto out;
+	}
+
+	if (rqh.length > 0) {
+		extra = malloc(rqh.length);
+		if (!extra) {
+			syslog(LOG_ERR, "process_connection no mem %lu", rqh.length);
+			goto out;
+		}
+		memset(extra, 0, rqh.length);
+
+		rv = do_read(fd, extra, rqh.length);
+		if (rv < 0) {
+			syslog(LOG_DEBUG, "connection %d extra read error %d", fd, rv);
+			goto out;
+		}
+	}
+
+	do_query_work(fd, extra, rqh.length);
+
+out:
+	close(fd);
+	if (extra) {
+		free(extra);
+	}
+
+	pthread_exit(0);
+}
+
 static void *csdo_query_process(void)
 {
-	struct csdo_request_header rqh;
 	int sd, fd, rv;
-	char *extra = NULL;
+	pthread_t thread;
 	char sock_path[PATH_MAX] = {};
 
 	snprintf(sock_path, sizeof(sock_path), "%s", CSDO_QUERY_QUERY_SOCK_PATH);
-	rv = setup_listener(sock_path);
-	if (rv < 0)
+	sd = setup_listener(sock_path);
+	if (sd < 0)
 		return NULL;
-
-	sd = rv;
 
 	for (;;) {
 		fd = accept(sd, NULL, NULL);
 		if (fd < 0)
 			return NULL;
 
-		rv = do_read(fd, &rqh, sizeof(rqh));
+		rv = pthread_create(&thread, NULL, csdo_query_handle, (void *)(uintptr_t)fd);
 		if (rv < 0) {
-			goto out;
-		}
-
-		if (rqh.bh.magic != CSDO_QUERY_MAGIC) {
-			goto out;
-		}
-
-		if ((rqh.bh.version & 0xFFFF0000) != (CSDO_QUERY_VERSION & 0xFFFF0000)) {
-			goto out;
-		}
-
-		if (rqh.length > 0) {
-			extra = malloc(rqh.length);
-			if (!extra) {
-				syslog(LOG_ERR, "process_connection no mem %lu", rqh.length);
-				goto out;
-			}
-			memset(extra, 0, rqh.length);
-
-			rv = do_read(fd, extra, rqh.length);
-			if (rv < 0) {
-				syslog(LOG_DEBUG, "connection %d extra read error %d", fd, rv);
-				goto out;
-			}
-		}
-
-		csdo_query_handle(fd, extra, rqh.length);
-
- out:
-		close(fd);
-		if (extra) {
-			free(extra);
-			extra = NULL;
+			syslog(LOG_CRIT, "pthread_create failed!");
+			close(fd);
 		}
 	}
 	return NULL;
