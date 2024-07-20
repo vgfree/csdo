@@ -4,6 +4,8 @@ After=syslog.target
 After=network.target
 
 [Service]
+StandardOutput=journal+console
+StandardError=journal+console
 Type=forking
 User=root
 Group=root
