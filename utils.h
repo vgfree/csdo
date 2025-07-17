@@ -1,14 +1,16 @@
 /*
-* Copyright(c) 2023-2024 IOdepth Corporation
-*/
+ * Copyright(c) 2024-2025 vgfree omstor
+ */
 #ifndef __UTILS_H__
 #define __UTILS_H__
 
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #define ARG_MAX          4096
+#define CSDO_SOCKET_PATH "/var/run/csdod.sock"
 
 struct cmd_arg_list {
 	int argc;
@@ -75,6 +77,7 @@ struct csdo_base_header {
 struct csdo_request_header {
 	struct csdo_base_header bh;
 	uint64_t length;
+	uid_t uid; /* Added for -u option */
 };
 
 struct csdo_respond_header {
@@ -84,9 +87,8 @@ struct csdo_respond_header {
 	int32_t result;
 };
 
-#define CSDO_QUERY_MAGIC			0xA12BA12B
-#define CSDO_QUERY_VERSION			0x00010001
-#define CSDO_QUERY_QUERY_SOCK_PATH		"csdo_query_sock"
+#define CSDO_QUERY_MAGIC                        0xA12BA12B
+#define CSDO_QUERY_VERSION                      0x00010001
 
 static inline void csdo_query_init_header(struct csdo_base_header *bh)
 {
