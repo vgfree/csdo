@@ -1,6 +1,7 @@
 /*
  * Copyright(c) 2024-2025 vgfree omstor
  */
+#define _GNU_SOURCE
 #include <unistd.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -17,63 +18,32 @@
 #include <syslog.h>
 #include <pwd.h>
 #include <grp.h>
+#include <poll.h>
 
 #include "utils.h"
-#define MIN(a, b) ((a) < (b) ? (a) : (b))
 
-static int do_read(int fd, void *buf, size_t count)
+/*
+ * Sets a file descriptor to non-blocking mode.
+ * Exits on failure to ensure consistent state.
+ */
+static void set_non_blocking(int fd)
 {
-	int rv;
-	size_t off = 0;
-
-	if (!buf) {
-		syslog(LOG_ERR, "do_read: null buffer");
-		return -1;
+	int flags = fcntl(fd, F_GETFL, 0);
+	if (flags == -1) {
+		syslog(LOG_ERR, "fcntl F_GETFL: %s", strerror(errno));
+		exit(EXIT_FAILURE);
 	}
-
-	while (off < count) {
-		rv = read(fd, (char *)buf + off, count - off);
-		if (rv == 0) {
-			syslog(LOG_ERR, "do_read: connection closed");
-			return -1;
-		}
-		if (rv == -1 && errno == EINTR)
-			continue;
-		if (rv == -1) {
-			syslog(LOG_ERR, "do_read: %s", strerror(errno));
-			return -1;
-		}
-		off += rv;
+	flags |= O_NONBLOCK;
+	if (fcntl(fd, F_SETFL, flags) == -1) {
+		syslog(LOG_ERR, "fcntl F_SETFL: %s", strerror(errno));
+		exit(EXIT_FAILURE);
 	}
-	return 0;
 }
 
-static int do_write(int fd, void *buf, size_t count)
-{
-	int rv, off = 0;
-
-	if (!buf) {
-		syslog(LOG_ERR, "do_write: null buffer");
-		return -1;
-	}
-
-retry:
-	rv = write(fd, (char *)buf + off, count);
-	if (rv == -1 && errno == EINTR)
-		goto retry;
-	if (rv < 0) {
-		syslog(LOG_ERR, "do_write: %s", strerror(errno));
-		return rv;
-	}
-
-	if (rv != count) {
-		count -= rv;
-		off += rv;
-		goto retry;
-	}
-	return 0;
-}
-
+/*
+ * Connects to the Unix domain socket at sock_path.
+ * Returns the socket descriptor or -1 on error.
+ */
 static int do_connect(const char *sock_path)
 {
 	struct sockaddr_un sun;
@@ -101,16 +71,26 @@ static int do_connect(const char *sock_path)
 	return fd;
 }
 
-int csdo_query_request(void *cmd, size_t len, uid_t uid)
+/*
+ * Sends a command request to the server and processes the response.
+ * cmd: Encoded command data.
+ * len: Length of the command data.
+ * uid: User ID to run the command as.
+ * no_pty: If non-zero, run without a PTY.
+ * Returns 0 on success, negative error code on failure.
+ */
+int csdo_query_request(void *cmd, size_t len, uid_t uid, int no_pty)
 {
 	struct csdo_request_header rqh = {};
 	struct csdo_respond_header rph = {};
 	int fd, rv;
 	char data[PAGE_SIZE];
+	struct pollfd pfds[2];
 
 	csdo_query_init_header(&rqh.bh);
 	rqh.length = len;
-	rqh.uid = uid; /* Set UID for csdod */
+	rqh.uid = uid;
+	rqh.no_pty = no_pty;
 
 	fd = do_connect(CSDO_SOCKET_PATH);
 	if (fd < 0) {
@@ -119,6 +99,7 @@ int csdo_query_request(void *cmd, size_t len, uid_t uid)
 			fprintf(stderr, "Permission denied: cannot connect to /var/run/csdod.sock\n");
 		goto out;
 	}
+	set_non_blocking(fd);
 
 	rv = do_write(fd, &rqh, sizeof(rqh));
 	if (rv < 0)
@@ -130,24 +111,27 @@ int csdo_query_request(void *cmd, size_t len, uid_t uid)
 			goto out_close;
 	}
 
-	do {
-		rv = do_read(fd, &rph, sizeof(rph));
-		if (rv < 0)
-			goto out_close;
-
-		if (rph.bh.magic != CSDO_QUERY_MAGIC) {
-			syslog(LOG_ERR, "csdo_query_request: invalid response magic: %u", rph.bh.magic);
-			rv = -1;
-			goto out_close;
-		}
-
-		uint64_t len = rph.length;
-		if (len == 0) {
-			rv = rph.result;
-			break;
-		}
-
-		if (len > 0) {
+	if (no_pty) {
+		/* Non-interactive mode: only read server output */
+		do {
+			rv = do_read(fd, &rph, sizeof(rph));
+			if (rv < 0)
+				goto out_close;
+			if (rph.bh.magic != CSDO_QUERY_MAGIC) {
+				syslog(LOG_ERR, "csdo_query_request: invalid response magic: %u", rph.bh.magic);
+				rv = -EINVAL;
+				goto out_close;
+			}
+			if (rph.length == 0) {
+				rv = rph.result;
+				break;
+			}
+			if (rph.std_fileno != STDOUT_FILENO && rph.std_fileno != STDERR_FILENO) {
+				syslog(LOG_ERR, "csdo_query_request: invalid std_fileno %d", rph.std_fileno);
+				rv = -EINVAL;
+				goto out_close;
+			}
+			uint64_t len = rph.length;
 			while (len) {
 				int todo = MIN(len, PAGE_SIZE);
 				rv = do_read(fd, data, todo);
@@ -155,15 +139,95 @@ int csdo_query_request(void *cmd, size_t len, uid_t uid)
 					goto out_close;
 				if (rph.std_fileno == STDOUT_FILENO || rph.std_fileno == STDERR_FILENO) {
 					rv = do_write(rph.std_fileno, data, todo);
-					if (rv < 0)
+					if (rv < 0) {
+						syslog(LOG_ERR, "csdo_query_request: write output: %s", strerror(errno));
 						goto out_close;
+					}
 				}
 				len -= todo;
 			}
+			fflush(rph.std_fileno == STDOUT_FILENO ? stdout : stderr);
+		} while (1);
+	} else {
+		/* Interactive mode: handle stdin and server output */
+		pfds[0].fd = STDIN_FILENO;
+		pfds[0].events = POLLIN;
+		pfds[1].fd = fd;
+		pfds[1].events = POLLIN;
+
+		while (1) {
+			rv = poll(pfds, 2, -1);
+			if (rv < 0) {
+				if (errno == EINTR || errno == EAGAIN)
+					continue;
+				fprintf(stderr, "csdo_query_request: poll: %s\n", strerror(errno));
+				syslog(LOG_ERR, "csdo_query_request: poll: %s", strerror(errno));
+				rv = -errno;
+				goto out_close;
+			}
+			if (rv == 0)
+				continue;
+
+			if (pfds[0].revents & (POLLIN | POLLHUP)) {
+				char buf[PAGE_SIZE];
+				struct csdo_respond_header dph = {};
+				csdo_query_init_header(&dph.bh);
+				dph.std_fileno = STDIN_FILENO;
+
+				ssize_t bytes = read(STDIN_FILENO, buf, sizeof(buf));
+				if (bytes <= 0) {
+					if (bytes == 0 || errno == EAGAIN)
+						continue;
+					syslog(LOG_ERR, "csdo_query_request: read stdin: %s", strerror(errno));
+					rv = -errno;
+					goto out_close;
+				}
+				dph.length = bytes;
+				rv = do_write(fd, &dph, sizeof(dph));
+				if (rv < 0)
+					goto out_close;
+				rv = do_write(fd, buf, bytes);
+				if (rv < 0)
+					goto out_close;
+			}
+
+			if (pfds[1].revents & (POLLIN | POLLHUP | POLLRDHUP)) {
+				rv = do_read(fd, &rph, sizeof(rph));
+				if (rv < 0)
+					goto out_close;
+				if (rph.bh.magic != CSDO_QUERY_MAGIC) {
+					syslog(LOG_ERR, "csdo_query_request: invalid response magic: %u", rph.bh.magic);
+					rv = -EINVAL;
+					goto out_close;
+				}
+				if (rph.length == 0) {
+					rv = rph.result;
+					break;
+				}
+				if (rph.std_fileno != STDOUT_FILENO && rph.std_fileno != STDERR_FILENO) {
+					syslog(LOG_ERR, "csdo_query_request: invalid std_fileno %d", rph.std_fileno);
+					rv = -EINVAL;
+					goto out_close;
+				}
+				uint64_t len = rph.length;
+				while (len) {
+					int todo = MIN(len, PAGE_SIZE);
+					rv = do_read(fd, data, todo);
+					if (rv < 0)
+						goto out_close;
+					if (rph.std_fileno == STDOUT_FILENO || rph.std_fileno == STDERR_FILENO) {
+						rv = do_write(rph.std_fileno, data, todo);
+						if (rv < 0) {
+							syslog(LOG_ERR, "csdo_query_request: write output: %s", strerror(errno));
+							goto out_close;
+						}
+					}
+					len -= todo;
+				}
+				fflush(rph.std_fileno == STDOUT_FILENO ? stdout : stderr);
+			}
 		}
-	} while (1);
-	fflush(stdout);
-	fflush(stderr);
+	}
 
 out_close:
 	close(fd);
@@ -171,6 +235,10 @@ out:
 	return rv;
 }
 
+/*
+ * Checks if the current user is in the sudo or wheel group.
+ * Returns 0 if the user is in either group, -1 on error, or -EPERM if not in either group.
+ */
 static int is_user_in_sudo_or_wheel_group(void)
 {
 	uid_t uid = getuid();
@@ -197,12 +265,17 @@ static int is_user_in_sudo_or_wheel_group(void)
 	return -EPERM;
 }
 
+/*
+ * Main function to parse arguments and send a command request to the server.
+ * argc, argv: Command-line arguments.
+ * Returns 0 on success, negative error code on failure.
+ */
 int main(int argc, char **argv)
 {
 	openlog("csdo", LOG_PID | LOG_CONS, LOG_DAEMON);
 
 	if (argc < 2) {
-		fprintf(stderr, "Usage: %s [-u username] <cmd> <...>\n", argv[0]);
+		fprintf(stderr, "Usage: %s [-u username] [-n] <cmd> <...>\n", argv[0]);
 		closelog();
 		return -EINVAL;
 	}
@@ -214,29 +287,64 @@ int main(int argc, char **argv)
 
 	struct cmd_arg_list list = {};
 	list.argc = 0;
+	list.cwd = NULL;
 	uid_t target_uid = 0; /* Default to root */
-
+	int no_pty = 0;
 	int optind = 1;
-	if (argc >= 3 && strcmp(argv[1], "-u") == 0) {
-		struct passwd *pw = getpwnam(argv[2]);
-		if (!pw) {
-			fprintf(stderr, "Invalid user: %s\n", argv[2]);
-			syslog(LOG_ERR, "main: invalid user '%s'", argv[2]);
+
+	while (optind < argc) {
+		if (strcmp(argv[optind], "-u") == 0) {
+			if (optind + 1 >= argc) {
+				fprintf(stderr, "Option -u requires an argument\n");
+				closelog();
+				return -EINVAL;
+			}
+			struct passwd *pw = getpwnam(argv[optind + 1]);
+			if (!pw) {
+				fprintf(stderr, "Invalid user: %s\n", argv[optind + 1]);
+				syslog(LOG_ERR, "main: invalid user '%s'", argv[optind + 1]);
+				closelog();
+				return -EINVAL;
+			}
+			target_uid = pw->pw_uid;
+			optind += 2;
+		} else if (strcmp(argv[optind], "-n") == 0) {
+			no_pty = 1;
+			optind++;
+		} else if (strcmp(argv[optind], "--help") == 0) {
+			printf("Usage: %s [options] <cmd> <...>\n", argv[0]);
+			printf("Options:\n");
+			printf("  -u <username>  Specify the user to run the command as (default: root)\n");
+			printf("  -n             Do not use a pseudo-terminal (PTY)\n");
+			printf("  --help         Display this help message and exit\n");
+			printf("\nDescription:\n");
+			printf("  csdo is a command-line tool to execute commands with specified user privileges.\n");
+			printf("  It requires root privileges or membership in the sudo or wheel group.\n");
 			closelog();
-			return -EINVAL;
+			exit(0);
+		} else {
+			break;
 		}
-		target_uid = pw->pw_uid;
-		optind = 3;
 	}
 
 	if (optind >= argc) {
-		fprintf(stderr, "Usage: %s [-u username] <cmd> <...>\n", argv[0]);
+		fprintf(stderr, "Usage: %s [-u username] [-n] <cmd> <...>\n", argv[0]);
 		closelog();
 		return -EINVAL;
 	}
 
 	list.argc = argc - optind;
 	memcpy(list.argv, argv + optind, sizeof(char *) * list.argc);
+
+	/* 获取当前工作目录 */
+	char cwd_buf[CSDO_CWD_MAX] = {};
+	if (getcwd(cwd_buf, sizeof(cwd_buf)) == NULL) {
+		syslog(LOG_ERR, "main: getcwd failed: %s", strerror(errno));
+		closelog();
+		return -errno;
+	}
+	list.cwd = cwd_buf;
+	syslog(LOG_DEBUG, "main: cwd='%s'", list.cwd);
 
 	uint32_t size = 0;
 	if (cmd_encode(&list, NULL, &size)) {
@@ -255,7 +363,7 @@ int main(int argc, char **argv)
 		closelog();
 		return -ENOMEM;
 	}
-	if (cmd_encode(&list, data, &size)) {
+	if (cmd_encode(&list, data, &size) || size == 0) {
 		syslog(LOG_ERR, "main: cmd_encode failed for command '%s'", argv[optind]);
 		free(data);
 		closelog();
@@ -263,7 +371,7 @@ int main(int argc, char **argv)
 	}
 	syslog(LOG_DEBUG, "main: encoded command '%s', size=%u", argv[optind], size);
 
-	int res = csdo_query_request(data, size, target_uid);
+	int res = csdo_query_request(data, size, target_uid, no_pty);
 	free(data);
 	closelog();
 	return res;
