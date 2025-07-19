@@ -19,6 +19,7 @@
 #include <pwd.h>
 #include <grp.h>
 #include <poll.h>
+#include <termios.h> // 添加 termios.h 以支持原始模式
 
 #include "utils.h"
 
@@ -72,6 +73,42 @@ static int do_connect(const char *sock_path)
 }
 
 /*
+ * Sets the terminal to raw mode and returns the original termios settings.
+ * Returns 0 on success, -1 on error.
+ */
+static int set_raw_mode(int fd, struct termios *orig_termios)
+{
+	struct termios term;
+
+	if (tcgetattr(fd, orig_termios) == -1) {
+		syslog(LOG_ERR, "set_raw_mode: tcgetattr: %s", strerror(errno));
+		return -1;
+	}
+
+	term = *orig_termios;
+	cfmakeraw(&term); // 设置原始模式
+	term.c_lflag &= ~(ECHO); // 禁用回显
+	term.c_cc[VMIN] = 1; // 最小读取字节数
+	term.c_cc[VTIME] = 0; // 无超时
+
+	if (tcsetattr(fd, TCSANOW, &term) == -1) {
+		syslog(LOG_ERR, "set_raw_mode: tcsetattr: %s", strerror(errno));
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * Restores the terminal to its original settings.
+ */
+static void restore_termios(int fd, struct termios *orig_termios)
+{
+	if (tcsetattr(fd, TCSANOW, orig_termios) == -1) {
+		syslog(LOG_ERR, "restore_termios: tcsetattr: %s", strerror(errno));
+	}
+}
+
+/*
  * Sends a command request to the server and processes the response.
  * cmd: Encoded command data.
  * len: Length of the command data.
@@ -86,6 +123,7 @@ int csdo_query_request(void *cmd, size_t len, uid_t uid, int no_pty)
 	int fd, rv;
 	char data[PAGE_SIZE];
 	struct pollfd pfds[2];
+	struct termios orig_termios; // 保存原始终端设置
 
 	csdo_query_init_header(&rqh.bh);
 	rqh.length = len;
@@ -150,6 +188,11 @@ int csdo_query_request(void *cmd, size_t len, uid_t uid, int no_pty)
 		} while (1);
 	} else {
 		/* Interactive mode: handle stdin and server output */
+		// 设置原始模式以处理交互式输入
+		if (set_raw_mode(STDIN_FILENO, &orig_termios) == -1) {
+			goto out_close;
+		}
+
 		pfds[0].fd = STDIN_FILENO;
 		pfds[0].events = POLLIN;
 		pfds[1].fd = fd;
@@ -163,7 +206,7 @@ int csdo_query_request(void *cmd, size_t len, uid_t uid, int no_pty)
 				fprintf(stderr, "csdo_query_request: poll: %s\n", strerror(errno));
 				syslog(LOG_ERR, "csdo_query_request: poll: %s", strerror(errno));
 				rv = -errno;
-				goto out_close;
+				goto out_restore;
 			}
 			if (rv == 0)
 				continue;
@@ -180,25 +223,25 @@ int csdo_query_request(void *cmd, size_t len, uid_t uid, int no_pty)
 						continue;
 					syslog(LOG_ERR, "csdo_query_request: read stdin: %s", strerror(errno));
 					rv = -errno;
-					goto out_close;
+					goto out_restore;
 				}
 				dph.length = bytes;
 				rv = do_write(fd, &dph, sizeof(dph));
 				if (rv < 0)
-					goto out_close;
+					goto out_restore;
 				rv = do_write(fd, buf, bytes);
 				if (rv < 0)
-					goto out_close;
+					goto out_restore;
 			}
 
 			if (pfds[1].revents & (POLLIN | POLLHUP | POLLRDHUP)) {
 				rv = do_read(fd, &rph, sizeof(rph));
 				if (rv < 0)
-					goto out_close;
+					goto out_restore;
 				if (rph.bh.magic != CSDO_QUERY_MAGIC) {
 					syslog(LOG_ERR, "csdo_query_request: invalid response magic: %u", rph.bh.magic);
 					rv = -EINVAL;
-					goto out_close;
+					goto out_restore;
 				}
 				if (rph.length == 0) {
 					rv = rph.result;
@@ -207,26 +250,31 @@ int csdo_query_request(void *cmd, size_t len, uid_t uid, int no_pty)
 				if (rph.std_fileno != STDOUT_FILENO && rph.std_fileno != STDERR_FILENO) {
 					syslog(LOG_ERR, "csdo_query_request: invalid std_fileno %d", rph.std_fileno);
 					rv = -EINVAL;
-					goto out_close;
+					goto out_restore;
 				}
 				uint64_t len = rph.length;
 				while (len) {
 					int todo = MIN(len, PAGE_SIZE);
 					rv = do_read(fd, data, todo);
 					if (rv < 0)
-						goto out_close;
+						goto out_restore;
 					if (rph.std_fileno == STDOUT_FILENO || rph.std_fileno == STDERR_FILENO) {
 						rv = do_write(rph.std_fileno, data, todo);
 						if (rv < 0) {
 							syslog(LOG_ERR, "csdo_query_request: write output: %s", strerror(errno));
-							goto out_close;
+							goto out_restore;
 						}
 					}
 					len -= todo;
 				}
+				// 立即刷新输出以保持 ANSI 序列的时序
 				fflush(rph.std_fileno == STDOUT_FILENO ? stdout : stderr);
 			}
 		}
+
+		// 恢复终端设置
+out_restore:
+		restore_termios(STDIN_FILENO, &orig_termios);
 	}
 
 out_close:

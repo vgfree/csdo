@@ -26,6 +26,8 @@
 #include <pwd.h>
 #include <pty.h>
 #include <time.h>
+#include <termios.h>
+#include <sys/ioctl.h>
 
 #include "utils.h"
 
@@ -198,15 +200,45 @@ int do_local_cmd(char **arglist, CSDO_GOT_CB got_cb, void *private, uid_t uid, i
 		c_err = err[1];
 		c_in = in[1];
 #endif
-
 		pid = fork();
 	} else {
 		int master;
-		pid = forkpty(&master, NULL, NULL, NULL);
+		struct termios term;
+		struct winsize ws;
+
+		// 获取客户端终端设置
+		if (tcgetattr(STDIN_FILENO, &term) == -1) {
+			syslog(LOG_ERR, "do_local_cmd: tcgetattr: %s", strerror(errno));
+			// 回退到默认设置
+			memset(&term, 0, sizeof(term));
+			cfmakeraw(&term);
+			term.c_lflag |= ICANON | ECHO; // 启用规范模式和回显
+			term.c_cc[VMIN] = 1;
+			term.c_cc[VTIME] = 0;
+		} else {
+			// 确保终端适合交互式应用
+			cfmakeraw(&term); // 设置原始模式以支持 vim
+			term.c_cc[VMIN] = 1;
+			term.c_cc[VTIME] = 0;
+			syslog(LOG_DEBUG, "do_local_cmd: tcgetattr succeeded, using raw mode");
+		}
+
+		// 获取客户端终端窗口大小
+		if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == -1) {
+			syslog(LOG_ERR, "do_local_cmd: ioctl TIOCGWINSZ: %s", strerror(errno));
+			ws.ws_row = 24;
+			ws.ws_col = 80;
+		} else {
+			syslog(LOG_DEBUG, "do_local_cmd: window size rows=%d, cols=%d", ws.ws_row, ws.ws_col);
+		}
+
+		// 创建 PTY 并应用终端设置
+		pid = forkpty(&master, NULL, &term, &ws);
 		if (pid != -1) {
 			p_out = p_err = p_in = master;
 			c_out = c_err = c_in = master;
-			set_non_blocking(master); // Set PTY master to non-blocking
+			// 不设置非阻塞模式以确保同步 I/O
+			// set_non_blocking(master);
 		}
 	}
 
@@ -246,6 +278,28 @@ int do_local_cmd(char **arglist, CSDO_GOT_CB got_cb, void *private, uid_t uid, i
 						break;
 					}
 					syslog(LOG_DEBUG, "do_local_cmd: changed to cwd='%s'", cwd);
+				}
+
+				/* 设置 TERM 环境变量 */
+				char *term = getenv("TERM");
+				if (term) {
+					setenv("TERM", term, 1);
+					syslog(LOG_DEBUG, "do_local_cmd: set TERM=%s", term);
+				} else {
+					setenv("TERM", "xterm-256color", 1); // 使用更现代的终端类型
+					syslog(LOG_DEBUG, "do_local_cmd: set default TERM=xterm-256color");
+				}
+
+				/* 设置 COLUMNS 和 LINES */
+				char *columns = getenv("COLUMNS");
+				if (columns) {
+					setenv("COLUMNS", columns, 1);
+					syslog(LOG_DEBUG, "do_local_cmd: set COLUMNS=%s", columns);
+				}
+				char *lines = getenv("LINES");
+				if (lines) {
+					setenv("LINES", lines, 1);
+					syslog(LOG_DEBUG, "do_local_cmd: set LINES=%s", lines);
 				}
 
 				if (no_pty) {
@@ -416,13 +470,13 @@ int do_local_cmd(char **arglist, CSDO_GOT_CB got_cb, void *private, uid_t uid, i
 client_error_out:
 			if (pid > 0) {
 				syslog(LOG_INFO, "do_local_cmd: terminating child pid %d due to client disconnect", pid);
-				kill(pid, SIGTERM); // Send SIGTERM
-				struct timespec ts = { .tv_sec = 1, .tv_nsec = 0 }; // 1-second timeout
-				nanosleep(&ts, NULL); // Wait for graceful termination
-				if (waitpid(pid, NULL, WNOHANG) == 0) { // Check if still running
+				kill(pid, SIGTERM);
+				struct timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
+				nanosleep(&ts, NULL);
+				if (waitpid(pid, NULL, WNOHANG) == 0) {
 					syslog(LOG_WARNING, "do_local_cmd: child pid %d did not terminate, sending SIGKILL", pid);
-					kill(pid, SIGKILL); // Force terminate
-					waitpid(pid, NULL, 0); // Ensure cleanup
+					kill(pid, SIGKILL);
+					waitpid(pid, NULL, 0);
 				}
 			}
 			goto error_out;
