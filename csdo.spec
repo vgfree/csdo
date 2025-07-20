@@ -51,7 +51,7 @@ fi
 %files
 %defattr(0755,root,root,-)
 /usr/bin/csdo
-/usr/sbin/csdod
+%attr(4750, root, wheel) /usr/sbin/csdod
 %{_unitdir}/csdod.service
 
 %changelog
