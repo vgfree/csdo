@@ -140,15 +140,17 @@ typedef void (*CSDO_GOT_CB)(void *private, void *data, uint64_t size, int std_fi
  * no_pty: If non-zero, use pipes/socketpairs instead of PTY.
  * client_fd: Client socket for communication.
  * cwd: Working directory to set for the command.
+ * ws: Window size to set for PTY.
  * Returns the command's exit status or -1 on error.
  */
-int do_local_cmd(char **arglist, CSDO_GOT_CB got_cb, void *private, uid_t uid, int no_pty, int client_fd, const char *cwd)
+int do_local_cmd(char **arglist, CSDO_GOT_CB got_cb, void *private, uid_t uid, int no_pty, int client_fd, const char *cwd, struct winsize *ws)
 {
 	int c_out, c_err, c_in;
 	int p_out, p_err, p_in;
 	int out[2], err[2], in[2];
 	pid_t pid;
 	int status;
+	int branch = 0;
 
 	/* 验证 arglist 和 got_cb */
 	if (!arglist || !arglist[0] || !got_cb) {
@@ -204,40 +206,29 @@ int do_local_cmd(char **arglist, CSDO_GOT_CB got_cb, void *private, uid_t uid, i
 	} else {
 		int master;
 		struct termios term;
-		struct winsize ws;
 
-		// 获取客户端终端设置
-		if (tcgetattr(STDIN_FILENO, &term) == -1) {
-			syslog(LOG_ERR, "do_local_cmd: tcgetattr: %s", strerror(errno));
-			// 回退到默认设置
-			memset(&term, 0, sizeof(term));
-			cfmakeraw(&term);
-			term.c_lflag |= ICANON | ECHO; // 启用规范模式和回显
-			term.c_cc[VMIN] = 1;
-			term.c_cc[VTIME] = 0;
+		/* 设置默认终端设置 */
+		memset(&term, 0, sizeof(term));
+		cfmakeraw(&term);
+		term.c_cc[VMIN] = 1;
+		term.c_cc[VTIME] = 0;
+		syslog(LOG_DEBUG, "do_local_cmd: using raw mode for PTY");
+
+		/* 使用客户端提供的窗口大小 */
+		struct winsize default_ws = { .ws_row = 24, .ws_col = 80 };
+		if (!ws) {
+			ws = &default_ws;
+			syslog(LOG_WARNING, "do_local_cmd: no window size provided, using default rows=%d, cols=%d", ws->ws_row, ws->ws_col);
 		} else {
-			// 确保终端适合交互式应用
-			cfmakeraw(&term); // 设置原始模式以支持 vim
-			term.c_cc[VMIN] = 1;
-			term.c_cc[VTIME] = 0;
-			syslog(LOG_DEBUG, "do_local_cmd: tcgetattr succeeded, using raw mode");
+			syslog(LOG_DEBUG, "do_local_cmd: window size rows=%d, cols=%d", ws->ws_row, ws->ws_col);
 		}
 
-		// 获取客户端终端窗口大小
-		if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == -1) {
-			syslog(LOG_ERR, "do_local_cmd: ioctl TIOCGWINSZ: %s", strerror(errno));
-			ws.ws_row = 24;
-			ws.ws_col = 80;
-		} else {
-			syslog(LOG_DEBUG, "do_local_cmd: window size rows=%d, cols=%d", ws.ws_row, ws.ws_col);
-		}
-
-		// 创建 PTY 并应用终端设置
-		pid = forkpty(&master, NULL, &term, &ws);
+		/* 创建 PTY 并应用终端设置 */
+		pid = forkpty(&master, NULL, &term, ws);
 		if (pid != -1) {
 			p_out = p_err = p_in = master;
 			c_out = c_err = c_in = master;
-			// 不设置非阻塞模式以确保同步 I/O
+			/* 不设置非阻塞模式以确保同步 I/O */
 			// set_non_blocking(master);
 		}
 	}
@@ -286,20 +277,18 @@ int do_local_cmd(char **arglist, CSDO_GOT_CB got_cb, void *private, uid_t uid, i
 					setenv("TERM", term, 1);
 					syslog(LOG_DEBUG, "do_local_cmd: set TERM=%s", term);
 				} else {
-					setenv("TERM", "xterm-256color", 1); // 使用更现代的终端类型
+					setenv("TERM", "xterm-256color", 1); /* 使用更现代的终端类型 */
 					syslog(LOG_DEBUG, "do_local_cmd: set default TERM=xterm-256color");
 				}
 
 				/* 设置 COLUMNS 和 LINES */
-				char *columns = getenv("COLUMNS");
-				if (columns) {
-					setenv("COLUMNS", columns, 1);
-					syslog(LOG_DEBUG, "do_local_cmd: set COLUMNS=%s", columns);
-				}
-				char *lines = getenv("LINES");
-				if (lines) {
-					setenv("LINES", lines, 1);
-					syslog(LOG_DEBUG, "do_local_cmd: set LINES=%s", lines);
+				if (ws) {
+					char cols[16], rows[16];
+					snprintf(cols, sizeof(cols), "%d", ws->ws_col);
+					snprintf(rows, sizeof(rows), "%d", ws->ws_row);
+					setenv("COLUMNS", cols, 1);
+					setenv("LINES", rows, 1);
+					syslog(LOG_DEBUG, "do_local_cmd: set COLUMNS=%s, LINES=%s", cols, rows);
 				}
 
 				if (no_pty) {
@@ -363,6 +352,7 @@ int do_local_cmd(char **arglist, CSDO_GOT_CB got_cb, void *private, uid_t uid, i
 			do {
 				if (out_finish && err_finish)
 					break;
+
 				idxs = 0;
 				if (!out_finish)
 					efds[idxs++] = p_out;
@@ -373,30 +363,45 @@ int do_local_cmd(char **arglist, CSDO_GOT_CB got_cb, void *private, uid_t uid, i
 
 				if (idxs < 0) {
 					syslog(LOG_ERR, "do_local_cmd: poll_wait failed: %s", strerror(errno));
-					goto error_out;
+					goto server_error_out;
 				}
 
 				for (i = 0; i < idxs; i++) {
 					if (efds[i] == client_fd) {
-						struct csdo_respond_header rph = {};
-						int rv = do_read(client_fd, &rph, sizeof(rph));
+						struct csdo_request_header rqh = {};
+						int rv = do_read(client_fd, &rqh, sizeof(rqh));
 						if (rv < 0) {
 							syslog(LOG_INFO, "do_local_cmd: client disconnected: %s", strerror(errno));
 							goto client_error_out; /* 客户端断开，直接清理 */
 						}
-						if (rph.bh.magic != CSDO_QUERY_MAGIC) {
-							syslog(LOG_ERR, "do_local_cmd: invalid response magic: %u", rph.bh.magic);
+						if (rqh.bh.magic != CSDO_QUERY_MAGIC) {
+							syslog(LOG_ERR, "do_local_cmd: invalid request magic: %u", rqh.bh.magic);
 							goto client_error_out;
 						}
-						if (rph.length == 0) {
-							syslog(LOG_INFO, "do_local_cmd: client sent empty response");
+						if (rqh.type == CSDO_MSG_WINSIZE) {
+							/* 处理窗口大小更新 */
+							if (!no_pty) {
+								if (ioctl(p_out, TIOCSWINSZ, &rqh.ws) == -1) {
+									syslog(LOG_ERR, "do_local_cmd: ioctl TIOCSWINSZ failed: %s", strerror(errno));
+								} else {
+									syslog(LOG_DEBUG, "do_local_cmd: updated window size rows=%d, cols=%d", rqh.ws.ws_row, rqh.ws.ws_col);
+								}
+							}
+							continue;
+						}
+						if (rqh.type != CSDO_MSG_OPERATE) {
+							syslog(LOG_ERR, "do_local_cmd: invalid request type %d", rqh.type);
 							goto client_error_out;
 						}
-						if (rph.std_fileno != STDIN_FILENO) {
-							syslog(LOG_ERR, "do_local_cmd: invalid std_fileno %d", rph.std_fileno);
+						if (rqh.length == 0) {
+							syslog(LOG_INFO, "do_local_cmd: client sent empty command");
 							goto client_error_out;
 						}
-						uint64_t len = rph.length;
+						if (rqh.std_fileno != STDIN_FILENO) {
+							syslog(LOG_ERR, "do_local_cmd: invalid std_fileno %d", rqh.std_fileno);
+							goto client_error_out;
+						}
+						uint64_t len = rqh.length;
 						while (len) {
 							int todo = MIN(len, PAGE_SIZE);
 							rv = do_read(client_fd, data, todo);
@@ -417,29 +422,44 @@ int do_local_cmd(char **arglist, CSDO_GOT_CB got_cb, void *private, uid_t uid, i
 							if (bytes > 0) {
 								got_cb(private, data, bytes, (efds[i] == p_out) ? STDOUT_FILENO : STDERR_FILENO);
 							} else if (bytes == 0) {
-								/* 管道被关闭 */
-								if (efds[i] == p_out)
+								/* 写端已关闭，管道无数据 */
+								if (no_pty) {
+									if (efds[i] == p_out)
+										out_finish = true;
+									else
+										err_finish = true;
+								} else {
 									out_finish = true;
-								else
 									err_finish = true;
+								}
 								break;
 							} else if (bytes == -1 && (errno == EAGAIN || errno == EINTR)) {
 								/* 非阻塞模式下，暂时没有数据可读 */
 								break;
 							} else {
-								if (errno != EIO)
-									syslog(LOG_ERR, "do_local_cmd: read fd %d: %s", efds[i], strerror(errno));
-								if (efds[i] == p_out)
+								/* 错误处理：兼容 PTY 在 EOF 时返回 EIO 的情况 */
+								if (errno == EIO && no_pty == 0) {
+									/* PTY 模式下，EIO 表示 EOF，可视作读完 */
 									out_finish = true;
-								else
 									err_finish = true;
-								goto child_error_out;
+									break;
+								} else {
+									/* 其他错误 */
+									syslog(LOG_ERR, "do_local_cmd: read fd %d: %s", efds[i], strerror(errno));
+									goto child_error_out;
+								}
 							}
 						} while (1);
 					}
 				}
 			} while (1);
 
+child_error_out:
+			branch++;
+client_error_out:
+			branch++;
+server_error_out:
+
 			if (no_pty) {
 				close(p_out);
 				close(p_err);
@@ -448,63 +468,72 @@ int do_local_cmd(char **arglist, CSDO_GOT_CB got_cb, void *private, uid_t uid, i
 				close(p_out);
 			}
 
-			while (waitpid(pid, &status, 0) == -1) {
-				if (errno != EINTR) {
-					syslog(LOG_CRIT, "do_local_cmd: waitpid: %s", strerror(errno));
+			switch (branch) {
+				case 0:
 					return -1;
-				}
+				case 1:
+					syslog(LOG_INFO, "do_local_cmd: terminating child pid %d due to client disconnect", pid);
+					kill(pid, SIGTERM);
+					struct timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
+					nanosleep(&ts, NULL);
+					/* 检查子进程状态 */
+					int ret = waitpid(pid, &status, WNOHANG);
+					if (ret == pid) {
+						/* 子进程状态已变化 */
+					} else if (ret == 0) {
+						/* 子进程尚未退出 */
+						syslog(LOG_WARNING, "do_local_cmd: child pid %d did not terminate, sending SIGKILL", pid);
+						kill(pid, SIGKILL);
+						while (waitpid(pid, &status, 0) == -1) {
+							if (errno != EINTR) {
+								syslog(LOG_CRIT, "do_local_cmd: waitpid: %s", strerror(errno));
+								return -1;
+							}
+						}
+					} else {
+						/* waitpid 出错 */
+						if (errno == ECHILD) {
+							syslog(LOG_ERR, "do_local_cmd: waitpid: No child process (pid %d), possibly already reaped, fd %d", pid, efds[i]);
+						} else {
+							syslog(LOG_ERR, "do_local_cmd: waitpid error for pid %d, fd %d: %s", pid, efds[i], strerror(errno));
+						}
+						return -1;
+					}
+					break;
+				case 2:
+					while (waitpid(pid, &status, 0) == -1) {
+						if (errno != EINTR) {
+							syslog(LOG_CRIT, "do_local_cmd: waitpid: %s", strerror(errno));
+							return -1;
+						}
+					}
+					break;
+				default:
+					abort();
 			}
 
+			/* 检查子进程状态 */
 			if (WIFEXITED(status)) {
 				/* 子进程正常退出 */
-				return WEXITSTATUS(status);
+				int code = WEXITSTATUS(status);
+				if (code == 0) {
+					syslog(LOG_DEBUG, "do_local_cmd: child pid %d exited normally, fd %d", pid, efds[i]);
+				} else {
+					syslog(LOG_ERR, "do_local_cmd: child pid %d exited with non-zero status %d, fd %d", pid, code, efds[i]);
+				}
+				return code;
 			} else if (WIFSIGNALED(status)) {
 				/* 子进程被信号终止 */
 				syslog(LOG_WARNING, "Child killed by signal %d", WTERMSIG(status));
 				return EXIT_FAILURE;
+			} else if (WIFSTOPPED(status)) {
+				syslog(LOG_WARNING, "Child stopped by signal %d", WSTOPSIG(status));
+				return EXIT_FAILURE;
 			} else {
-				syslog(LOG_ERR, "Child process in unexpected state: %d", status);
+				/* 子进程异常退出 */
+				syslog(LOG_ERR, "do_local_cmd: child pid %d exited abnormally (unknown status), fd %d", pid, efds[i]);
 				return EXIT_FAILURE;
 			}
-
-client_error_out:
-			if (pid > 0) {
-				syslog(LOG_INFO, "do_local_cmd: terminating child pid %d due to client disconnect", pid);
-				kill(pid, SIGTERM);
-				struct timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
-				nanosleep(&ts, NULL);
-				if (waitpid(pid, NULL, WNOHANG) == 0) {
-					syslog(LOG_WARNING, "do_local_cmd: child pid %d did not terminate, sending SIGKILL", pid);
-					kill(pid, SIGKILL);
-					waitpid(pid, NULL, 0);
-				}
-			}
-			goto error_out;
-child_error_out:
-			if (pid > 0) {
-				/* 检查子进程状态 */
-				if (waitpid(pid, &status, WNOHANG) == pid) {
-					if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-						/* 子进程正常退出 */
-						syslog(LOG_DEBUG, "do_local_cmd: child pid %d exited normally, fd %d", pid, efds[i]);
-					} else {
-						/* 子进程异常退出 */
-						syslog(LOG_ERR, "do_local_cmd: child pid %d exited abnormally with status %d, fd %d", pid, WEXITSTATUS(status), efds[i]);
-					}
-				} else {
-					/* 子进程未退出，记录错误 */
-					syslog(LOG_DEBUG, "do_local_cmd: read fd %d: %s, child pid %d still running", efds[i], strerror(errno), pid);
-				}
-			}
-error_out:
-			if (no_pty) {
-				close(p_out);
-				close(p_err);
-				close(p_in);
-			} else {
-				close(p_out);
-			}
-			return -1;
 	}
 }
 
@@ -622,8 +651,9 @@ static void csdo_got_cb(void *private, void *data, uint64_t size, int std_fileno
  * len: Length of the command data.
  * uid: User ID to run the command as.
  * no_pty: If non-zero, run without a PTY.
+ * ws: Window size to set for PTY.
  */
-static void do_query_work(int fd, char *cmd, uint64_t len, uid_t uid, int no_pty)
+static void do_query_work(int fd, char *cmd, uint64_t len, uid_t uid, int no_pty, struct winsize *ws)
 {
 	struct cmd_arg_list list = {};
 
@@ -644,7 +674,7 @@ static void do_query_work(int fd, char *cmd, uint64_t len, uid_t uid, int no_pty
 		syslog(LOG_DEBUG, "do_query_work: cwd='%s'", list.cwd);
 	}
 
-	int result = do_local_cmd(list.argv, csdo_got_cb, (void *)&fd, uid, no_pty, fd, list.cwd);
+	int result = do_local_cmd(list.argv, csdo_got_cb, (void *)&fd, uid, no_pty, fd, list.cwd, ws);
 
 	struct csdo_respond_header rph = {};
 	csdo_query_init_header(&rph.bh);
@@ -684,6 +714,17 @@ static void *csdo_query_handle(void *arg)
 		goto out;
 	}
 
+	if (rqh.type == CSDO_MSG_WINSIZE) {
+		/* 不应在连接初始化时收到窗口大小更新 */
+		syslog(LOG_ERR, "csdo_query_handle: unexpected winsize message at connection start");
+		goto out;
+	}
+
+	if (rqh.type != CSDO_MSG_COMMAND) {
+		syslog(LOG_ERR, "csdo_query_handle: invalid request type %d", rqh.type);
+		goto out;
+	}
+
 	if (rqh.length > 0) {
 		extra = malloc(rqh.length);
 		if (!extra) {
@@ -699,7 +740,7 @@ static void *csdo_query_handle(void *arg)
 		}
 	}
 
-	do_query_work(fd, extra, rqh.length, rqh.uid, rqh.no_pty);
+	do_query_work(fd, extra, rqh.length, rqh.uid, rqh.no_pty, &rqh.ws);
 
 out:
 	if (extra) {
@@ -722,12 +763,6 @@ static void *csdo_query_process(void)
 	/* Check if running as root */
 	if (geteuid() != 0) {
 		syslog(LOG_CRIT, "csdod must run as root");
-		return NULL;
-	}
-
-	/* 忽略 SIGCHLD 信号以防止中断 accept() */
-	if (ssh_signal(SIGCHLD, SIG_IGN) == SIG_ERR) {
-		syslog(LOG_CRIT, "Failed to ignore SIGCHLD: %s", strerror(errno));
 		return NULL;
 	}
 

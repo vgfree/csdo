@@ -16,6 +16,47 @@
 #define CSDO_CWD_MAX     4096  /* 最大工作目录长度，与 PATH_MAX 一致 */
 #define CSDO_SOCKET_PATH "/var/run/csdod.sock"
 
+#define CSDO_QUERY_MAGIC 0x4353444F /* 'CSDO' */
+#define CSDO_QUERY_VERSION 0x00010000 /* 1.0.0 */
+#define CSDO_MSG_COMMAND 0 /* 命令请求 */
+#define CSDO_MSG_WINSIZE 1 /* 窗口大小更新 */
+#define CSDO_MSG_OPERATE 2 /* 交互操作 */
+
+struct csdo_base_header {
+	uint32_t magic;
+	uint32_t version;
+};
+
+struct csdo_request_header {
+	struct csdo_base_header bh;
+	uint64_t length; /* 命令数据长度 */
+	uid_t uid; /* 执行命令的用户 ID */
+	int no_pty; /* 是否禁用 PTY */
+	int type; /* 消息类型：CSDO_MSG_COMMAND 或 CSDO_MSG_WINSIZE */
+	int std_fileno; /* 输入数据对应的文件描述符（仅用于命令数据） */
+	struct winsize ws; /* 终端窗口大小 */
+};
+
+struct csdo_respond_header {
+	struct csdo_base_header bh;
+	uint64_t length; /* 输出数据长度 */
+	int result; /* 命令退出状态 */
+	int std_fileno; /* 输出数据对应的文件描述符 */
+};
+
+
+/*
+ * Initializes a csdo_base_header with magic and version.
+ * bh: Pointer to the header to initialize.
+ */
+static inline void csdo_query_init_header(struct csdo_base_header *bh)
+{
+	memset(bh, 0, sizeof(struct csdo_base_header));
+
+	bh->magic = CSDO_QUERY_MAGIC;
+	bh->version = CSDO_QUERY_VERSION;
+}
+
 struct cmd_arg_list {
 	int argc;
 	char *argv[ARG_MAX];
@@ -139,54 +180,49 @@ static inline int cmd_decode(struct cmd_arg_list *list, char *data, uint32_t siz
 	/* 解码 argc */
 	psize = (uint32_t *)data;
 	list->argc = *psize;
-	syslog(LOG_DEBUG, "cmd_decode: decoded argc=%d", list->argc);
-	if (list->argc <= 0 || list->argc > ARG_MAX) {
-		syslog(LOG_ERR, "cmd_decode: invalid argc %d (must be 1 to %d)", list->argc, ARG_MAX);
+	if (list->argc < 1 || list->argc > ARG_MAX) {
+		syslog(LOG_ERR, "cmd_decode: invalid argc=%d", list->argc);
 		return -1;
 	}
 	psize++;
 	done += sizeof(uint32_t);
 
-	/* 检查参数长度数组空间 */
-	if (done + list->argc * sizeof(uint32_t) > size) {
-		syslog(LOG_ERR, "cmd_decode: insufficient buffer for %d arg lengths (done=%u, size=%u)", list->argc, done, size);
+	/* 验证缓冲区大小 */
+	if (size < done + list->argc * sizeof(uint32_t) + sizeof(uint32_t)) {
+		syslog(LOG_ERR, "cmd_decode: buffer too small (%u < %lu)", size,
+				done + list->argc * sizeof(uint32_t) + sizeof(uint32_t));
 		return -1;
 	}
 
 	/* 解码参数长度 */
-	uint32_t *arg_lengths = psize;
+	uint32_t arg_len[ARG_MAX];
 	for (i = 0; i < list->argc; i++) {
-		if (arg_lengths[i] == 0) {
-			syslog(LOG_ERR, "cmd_decode: invalid zero length for arg %d", i);
+		arg_len[i] = *psize;
+		if (arg_len[i] == 0 || arg_len[i] > size) {
+			syslog(LOG_ERR, "cmd_decode: invalid arg_len[%d]=%u", i, arg_len[i]);
 			return -1;
 		}
-		syslog(LOG_DEBUG, "cmd_decode: arg[%d] length=%u", i, arg_lengths[i]);
+		psize++;
+		done += sizeof(uint32_t);
 	}
-	psize += list->argc;
-	done += list->argc * sizeof(uint32_t);
 
 	/* 解码 cwd 长度 */
-	if (done + sizeof(uint32_t) > size) {
-		syslog(LOG_ERR, "cmd_decode: insufficient buffer for cwd length (done=%u, size=%u)", done, size);
-		return -1;
-	}
 	uint32_t cwd_len = *psize;
 	if (cwd_len >= CSDO_CWD_MAX) {
-		syslog(LOG_ERR, "cmd_decode: cwd length too long (%u >= %d)", cwd_len, CSDO_CWD_MAX);
+		syslog(LOG_ERR, "cmd_decode: cwd_len=%u exceeds CSDO_CWD_MAX=%d", cwd_len, CSDO_CWD_MAX);
 		return -1;
 	}
-	syslog(LOG_DEBUG, "cmd_decode: cwd length=%u", cwd_len);
 	psize++;
 	done += sizeof(uint32_t);
 
 	/* 验证总长度 */
-	uint32_t total_data_len = 0;
+	uint32_t total_len = done;
 	for (i = 0; i < list->argc; i++) {
-		total_data_len += arg_lengths[i];
+		total_len += arg_len[i];
 	}
-	total_data_len += cwd_len;
-	if (done + total_data_len > size) {
-		syslog(LOG_ERR, "cmd_decode: insufficient buffer for args and cwd (done=%u, total_data_len=%u, size=%u)", done, total_data_len, size);
+	total_len += cwd_len;
+	if (total_len > size) {
+		syslog(LOG_ERR, "cmd_decode: total length %u exceeds buffer size %u", total_len, size);
 		return -1;
 	}
 
@@ -194,65 +230,29 @@ static inline int cmd_decode(struct cmd_arg_list *list, char *data, uint32_t siz
 	pdata = (char *)psize;
 	for (i = 0; i < list->argc; i++) {
 		/* 验证字符串长度和 NUL 终止 */
-		if (pdata[arg_lengths[i] - 1] != '\0') {
+		if (pdata[arg_len[i] - 1] != '\0') {
 			syslog(LOG_ERR, "cmd_decode: arg %d not null-terminated", i);
 			return -1;
 		}
 		list->argv[i] = pdata;
 		syslog(LOG_DEBUG, "cmd_decode: decoded argv[%d]='%s'", i, list->argv[i]);
-		pdata += arg_lengths[i];
-		done += arg_lengths[i];
+		pdata += arg_len[i];
+		done += arg_len[i];
 	}
 
-	/* 解码 cwd */
+	/* 解码 cwd 字符串 */
 	if (cwd_len > 0) {
 		if (pdata[cwd_len - 1] != '\0') {
 			syslog(LOG_ERR, "cmd_decode: cwd not null-terminated");
 			return -1;
 		}
 		list->cwd = pdata;
+		done += cwd_len;
 		syslog(LOG_DEBUG, "cmd_decode: decoded cwd='%s'", list->cwd);
-	} else {
-		list->cwd = NULL;
-		syslog(LOG_DEBUG, "cmd_decode: no cwd provided");
 	}
 
 	syslog(LOG_DEBUG, "cmd_decode: total decoded size=%u", done);
 	return 0;
-}
-
-struct csdo_base_header {
-	uint32_t magic;
-	uint32_t version;
-};
-
-struct csdo_request_header {
-	struct csdo_base_header bh;
-	uint64_t length;
-	uid_t uid; /* Added for -u option */
-	int32_t no_pty; /* Added for -n option */
-};
-
-struct csdo_respond_header {
-	struct csdo_base_header bh;
-	uint64_t length;
-	uint32_t std_fileno;
-	int32_t result;
-};
-
-#define CSDO_QUERY_MAGIC                        0xA12BA12B
-#define CSDO_QUERY_VERSION                      0x00010001
-
-/*
- * Initializes a csdo_base_header with magic and version.
- * bh: Pointer to the header to initialize.
- */
-static inline void csdo_query_init_header(struct csdo_base_header *bh)
-{
-	memset(bh, 0, sizeof(struct csdo_base_header));
-
-	bh->magic = CSDO_QUERY_MAGIC;
-	bh->version = CSDO_QUERY_VERSION;
 }
 
 /*
