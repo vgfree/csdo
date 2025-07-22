@@ -21,10 +21,12 @@
 #include <signal.h>
 #include <poll.h>
 #include <sys/wait.h>
+#include <sys/epoll.h>
 #include <pthread.h>
 #include <grp.h>
 #include <pwd.h>
 #include <pty.h>
+#include <utmp.h>
 #include <time.h>
 #include <termios.h>
 #include <sys/ioctl.h>
@@ -32,77 +34,133 @@
 
 #include "utils.h"
 
-/*
- * Polls an array of file descriptors for input events.
- * efds: Array of file descriptors to poll.
- * nums: Number of file descriptors.
- * timeout: Timeout in milliseconds (-1 for infinite).
- * Returns number of ready fds, 0 on timeout, or -1 on error.
- */
-static int poll_wait(int efds[], int nums, int timeout)
-{
-	int     max = nums;
-	struct pollfd pfds[max];
+enum exit_steps_code {
+	exit_steps_success = 0,
+	exit_steps_server_error,
+	exit_steps_client_error,
+	exit_steps_child_error,
+};
 
-	for (int i = 0; i < max; i++) {
-		pfds[i].fd = efds[i];
-		pfds[i].events = POLLIN;
+// 资源结构体，用于管理文件描述符
+typedef struct relay_session {
+	int client_fd;        // 客户端文件描述符
+	int master_fd;        // PTY 主文件描述符
+	int slave_fd;         // PTY 从文件描述符
+	int pipe_stdin[2];    // 标准输入管道
+	int pipe_stdout[2];   // 标准输出管道
+	int pipe_stderr[2];   // 标准错误管道
+	int epoll_fd;         // epoll 文件描述符
+	int no_pty;
+} relay_session_t;
+
+// 初始化资源结构体
+void init_relay_session(relay_session_t *rs) {
+	rs->client_fd = -1;
+	rs->master_fd = -1;
+	rs->slave_fd = -1;
+	rs->pipe_stdin[0] = rs->pipe_stdin[1] = -1;
+	rs->pipe_stdout[0] = rs->pipe_stdout[1] = -1;
+	rs->pipe_stderr[0] = rs->pipe_stderr[1] = -1;
+	rs->epoll_fd = -1;
+}
+
+// 清理资源，关闭所有打开的文件描述符
+void cleanup_relay_session(relay_session_t *rs) {
+	if (rs->master_fd != -1) {
+		close(rs->master_fd);
+		x_printf(LOG_INFO, "Closed master_fd=%d", rs->master_fd);
 	}
-
-	while (1) {
-		int have = poll(pfds, max, timeout);
-
-		if (have < 0) {
-			if ((errno == EINTR) || (errno == EAGAIN)) {
-				continue;
-			}
-			syslog(LOG_ERR, "poll_wait: error %d: %s", errno, strerror(errno));
-			return -1;
-		} else if (have == 0) {
-			/* timeout */
-			return 0;
-		} else {
-			int done = 0;
-
-			/* An event on one of the fds has occurred. */
-			for (int i = 0; i < max; i++) {
-				int ev = pfds[i].revents;
-
-				if (ev & (POLLERR | POLLNVAL)) {
-					syslog(LOG_ERR, "poll_wait: invalid event on fd %d", pfds[i].fd);
-					return -1;
-				}
-
-				/* 写端关闭,会触发POLLHUP */
-				if (ev & (POLLIN | POLLHUP | POLLRDHUP)) {
-					efds[done] = pfds[i].fd;
-					done++;
-					if (done == have) {
-						break;
-					}
-				}
-			}
-			return have;
-		}
+	if (rs->slave_fd != -1) {
+		close(rs->slave_fd);
+		x_printf(LOG_INFO, "Closed slave_fd=%d", rs->slave_fd);
+	}
+	if (rs->pipe_stdin[0] != -1) {
+		close(rs->pipe_stdin[0]);
+		x_printf(LOG_INFO, "Closed pipe_stdin[0]=%d", rs->pipe_stdin[0]);
+	}
+	if (rs->pipe_stdin[1] != -1) {
+		close(rs->pipe_stdin[1]);
+		x_printf(LOG_INFO, "Closed pipe_stdin[1]=%d", rs->pipe_stdin[1]);
+	}
+	if (rs->pipe_stdout[0] != -1) {
+		close(rs->pipe_stdout[0]);
+		x_printf(LOG_INFO, "Closed pipe_stdout[0]=%d", rs->pipe_stdout[0]);
+	}
+	if (rs->pipe_stdout[1] != -1) {
+		close(rs->pipe_stdout[1]);
+		x_printf(LOG_INFO, "Closed pipe_stdout[1]=%d", rs->pipe_stdout[1]);
+	}
+	if (rs->pipe_stderr[0] != -1) {
+		close(rs->pipe_stderr[0]);
+		x_printf(LOG_INFO, "Closed pipe_stderr[0]=%d", rs->pipe_stderr[0]);
+	}
+	if (rs->pipe_stderr[1] != -1) {
+		close(rs->pipe_stderr[1]);
+		x_printf(LOG_INFO, "Closed pipe_stderr[1]=%d", rs->pipe_stderr[1]);
+	}
+	if (rs->epoll_fd != -1) {
+		close(rs->epoll_fd);
+		x_printf(LOG_INFO, "Closed epoll_fd=%d", rs->epoll_fd);
 	}
 }
 
-/*
- * Sets a file descriptor to non-blocking mode.
- * Exits on failure to ensure consistent state.
- */
-static void set_non_blocking(int fd)
-{
-	int flags = fcntl(fd, F_GETFL, 0);
-	if (flags == -1) {
-		syslog(LOG_ERR, "fcntl F_GETFL: %s", strerror(errno));
-		exit(EXIT_FAILURE);
+// 创建标准输入、输出和错误管道
+int create_pipes(relay_session_t *rs) {
+#ifdef USE_PIPES
+	if (pipe(rs->pipe_stdin) == -1) {
+		x_printf(LOG_ERR, "Failed to create stdin pipe: %s", strerror(errno));
+		return -1;
 	}
-	flags |= O_NONBLOCK;
-	if (fcntl(fd, F_SETFL, flags) == -1) {
-		syslog(LOG_ERR, "fcntl F_SETFL: %s", strerror(errno));
-		exit(EXIT_FAILURE);
+	fcntl(rs->pipe_stdin[1], F_SETFD, FD_CLOEXEC); // 设置 stdin 写端在 exec 时关闭，保证epoll_wait能收到事件处理EOF
+	x_printf(LOG_INFO, "Created stdin pipe: read=%d, write=%d", rs->pipe_stdin[0], rs->pipe_stdin[1]);
+
+	if (pipe(rs->pipe_stdout) == -1) {
+		x_printf(LOG_ERR, "Failed to create stdout pipe: %s", strerror(errno));
+		return -1;
 	}
+	fcntl(rs->pipe_stdout[1], F_SETFD, FD_CLOEXEC); // 设置 stdout 写端在 exec 时关闭，保证epoll_wait能收到事件处理EOF
+	x_printf(LOG_INFO, "Created stdout pipe: read=%d, write=%d", rs->pipe_stdout[0], rs->pipe_stdout[1]);
+
+	if (pipe(rs->pipe_stderr) == -1) {
+		x_printf(LOG_ERR, "Failed to create stderr pipe: %s", strerror(errno));
+		return -1;
+	}
+	fcntl(rs->pipe_stderr[1], F_SETFD, FD_CLOEXEC); // 设置 stderr 写端在 exec 时关闭，保证epoll_wait能收到事件处理EOF
+	x_printf(LOG_INFO, "Created stderr pipe: read=%d, write=%d", rs->pipe_stderr[0], rs->pipe_stderr[1]);
+#else
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, rs->pipe_stdin) == -1) {
+		x_printf(LOG_ERR, "Failed to create stdin socketpair: %s", strerror(errno));
+		return -1;
+	}
+	fcntl(rs->pipe_stdin[1], F_SETFD, FD_CLOEXEC); // 设置 stdin 写端在 exec 时关闭，保证epoll_wait能收到事件处理EOF
+	x_printf(LOG_INFO, "Created stdin pipe: read=%d, write=%d", rs->pipe_stdin[0], rs->pipe_stdin[1]);
+
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, rs->pipe_stdout) == -1) {
+		x_printf(LOG_ERR, "Failed to create stdout socketpair: %s", strerror(errno));
+		return -1;
+	}
+	fcntl(rs->pipe_stdout[1], F_SETFD, FD_CLOEXEC); // 设置 stdout 写端在 exec 时关闭，保证epoll_wait能收到事件处理EOF
+	x_printf(LOG_INFO, "Created stdout pipe: read=%d, write=%d", rs->pipe_stdout[0], rs->pipe_stdout[1]);
+
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, rs->pipe_stderr) == -1) {
+		x_printf(LOG_ERR, "Failed to create stderr socketpair: %s", strerror(errno));
+		return -1;
+	}
+	fcntl(rs->pipe_stderr[1], F_SETFD, FD_CLOEXEC); // 设置 stderr 写端在 exec 时关闭，保证epoll_wait能收到事件处理EOF
+	x_printf(LOG_INFO, "Created stderr pipe: read=%d, write=%d", rs->pipe_stderr[0], rs->pipe_stderr[1]);
+#endif
+	return 0;
+}
+
+// 注册文件描述符到 epoll
+int register_epoll(int epfd, int fd, const char *name) {
+	struct epoll_event ev = { .events = EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLRDHUP, .data.fd = fd };
+	if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) == -1) {
+		x_printf(LOG_ERR, "Failed to register %s=%d with epoll: %s", name, fd, strerror(errno));
+		return -1;
+	}
+	x_printf(LOG_INFO, "Registered %s=%d with epoll", name, fd);
+	return 0;
 }
 
 typedef void (*sshsig_t)(int);
@@ -124,13 +182,228 @@ sshsig_t ssh_signal(int signum, sshsig_t handler)
 		sa.sa_flags = SA_RESTART;
 #endif
 	if (sigaction(signum, &sa, &osa) == -1) {
-		syslog(LOG_WARNING, "sigaction(%s): %s", strsignal(signum), strerror(errno));
+		x_printf(LOG_WARNING, "sigaction(%s): %s", strsignal(signum), strerror(errno));
 		return SIG_ERR;
 	}
 	return osa.sa_handler;
 }
 
 typedef void (*CSDO_GOT_CB)(void *private, void *data, uint64_t size, int std_fileno);
+
+void child_process(relay_session_t *rs)
+{
+	// 忽略 SIGHUP 和 SIGPIPE 信号
+	signal(SIGHUP, SIG_IGN);
+	signal(SIGPIPE, SIG_IGN);
+	x_printf(LOG_INFO, "Child: Ignored SIGHUP and SIGPIPE signals");
+
+	// 关闭子进程不需要的文件描述符
+	close(rs->client_fd);
+	x_printf(LOG_INFO, "Child: Closed client_fd=%d", rs->client_fd);
+	if (!rs->no_pty) {
+		close(rs->master_fd);
+		x_printf(LOG_INFO, "Child: Closed master_fd=%d", rs->master_fd);
+	}
+	close(rs->pipe_stdin[1]);
+	x_printf(LOG_INFO, "Child: Closed pipe_stdin[1]=%d", rs->pipe_stdin[1]);
+	close(rs->pipe_stdout[0]);
+	x_printf(LOG_INFO, "Child: Closed pipe_stdout[0]=%d", rs->pipe_stdout[0]);
+	close(rs->pipe_stderr[0]);
+	x_printf(LOG_INFO, "Child: Closed pipe_stderr[0]=%d", rs->pipe_stderr[0]);
+
+	if (!rs->no_pty) {
+		// 设置 slave_fd 为控制终端
+		if (login_tty(rs->slave_fd) == -1) {
+			x_printf(LOG_ERR, "Child: login_tty failed on slave_fd=%d: %s", rs->slave_fd, strerror(errno));
+			exit(EXIT_FAILURE);
+		}
+		x_printf(LOG_INFO, "Child: login_tty succeeded on slave_fd=%d", rs->slave_fd);
+	}
+
+	// 重定向标准输入
+	if (dup2(rs->pipe_stdin[0], STDIN_FILENO) == -1) {
+		x_printf(LOG_ERR, "Child: dup2 stdin failed: %s", strerror(errno));
+		exit(EXIT_FAILURE);
+	}
+	close(rs->pipe_stdin[0]);
+	x_printf(LOG_INFO, "Child: Closed pipe_stdin[0]=%d", rs->pipe_stdin[0]);
+
+	// 重定向标准输出
+	if (dup2(rs->pipe_stdout[1], STDOUT_FILENO) == -1) {
+		x_printf(LOG_ERR, "Child: dup2 stdout failed: %s", strerror(errno));
+		exit(EXIT_FAILURE);
+	}
+	close(rs->pipe_stdout[1]);
+	x_printf(LOG_INFO, "Child: Closed pipe_stdout[1]=%d", rs->pipe_stdout[1]);
+
+	// 重定向标准错误
+	if (dup2(rs->pipe_stderr[1], STDERR_FILENO) == -1) {
+		x_printf(LOG_ERR, "Child: dup2 stderr failed: %s", strerror(errno));
+		exit(EXIT_FAILURE);
+	}
+	close(rs->pipe_stderr[1]);
+	x_printf(LOG_INFO, "Child: Closed pipe_stderr[1]=%d", rs->pipe_stderr[1]);
+
+	if (!rs->no_pty) {
+		close(rs->slave_fd);
+		x_printf(LOG_INFO, "Child: Closed slave_fd=%d", rs->slave_fd);
+	}
+}
+
+int do_client_event(relay_session_t *rs)
+{
+	char data[PAGE_SIZE] = {};
+	int fd = rs->client_fd;
+	struct csdo_request_header rqh = {};
+	int rv = do_read(fd, &rqh, sizeof(rqh));
+	if (rv < 0) {
+		x_printf(LOG_INFO, "do_local_cmd: client disconnected: %s", strerror(errno));
+		return exit_steps_client_error; /* 客户端断开，直接清理 */
+	}
+	if (rqh.bh.magic != CSDO_QUERY_MAGIC) {
+		x_printf(LOG_ERR, "do_local_cmd: invalid request magic: %u", rqh.bh.magic);
+		return exit_steps_client_error;
+	}
+	if (rqh.type == CSDO_MSG_WINSIZE) {
+		/* 处理窗口大小更新 */
+		if (!rs->no_pty) {
+			if (ioctl(rs->master_fd, TIOCSWINSZ, &rqh.ws) == -1) {
+				x_printf(LOG_ERR, "do_local_cmd: ioctl TIOCSWINSZ failed: %s", strerror(errno));
+			} else {
+				x_printf(LOG_DEBUG, "do_local_cmd: updated window size rows=%d, cols=%d", rqh.ws.ws_row, rqh.ws.ws_col);
+			}
+		}
+		return exit_steps_success;
+	}
+	if (rqh.type != CSDO_MSG_OPERATE) {
+		x_printf(LOG_ERR, "do_local_cmd: invalid request type %d", rqh.type);
+		return exit_steps_client_error;
+	}
+	if (rqh.std_fileno != STDIN_FILENO) {
+		x_printf(LOG_ERR, "do_local_cmd: invalid std_fileno %d", rqh.std_fileno);
+		return exit_steps_client_error;
+	}
+	if (rqh.length == 0) {
+		x_printf(LOG_INFO, "do_local_cmd: client tell input over");
+		// 关闭标准输入管道写端以触发 EOF
+		close(rs->pipe_stdin[1]);
+		x_printf(LOG_INFO, "Parent: Closed pipe_stdin[1]=%d to trigger EOF", rs->pipe_stdin[1]);
+		rs->pipe_stdin[1] = -1;
+		return exit_steps_success;
+	}
+	uint64_t len = rqh.length;
+	while (len) {
+		int todo = MIN(len, PAGE_SIZE);
+		rv = do_read(fd, data, todo);
+		if (rv < 0) {
+			x_printf(LOG_INFO, "do_local_cmd: read client data failed: %s", strerror(errno));
+			return exit_steps_client_error;
+		}
+		rv = do_write(rs->pipe_stdin[1], data, todo);
+		if (rv < 0) {
+			x_printf(LOG_ERR, "do_local_cmd: write stdin: %s", strerror(errno));
+			return exit_steps_child_error;
+		}
+		len -= todo;
+	}
+	return exit_steps_success;
+}
+
+// 处理 epoll 事件
+int handle_epoll_events(int epfd, relay_session_t *rs, CSDO_GOT_CB got_cb, void *private)
+{
+	int max = 4;
+	struct epoll_event events[max];
+	bool stdout_done = false, stderr_done = false, child_exited = (rs->no_pty) ? true : false;
+
+	while (!(stdout_done && stderr_done && child_exited)) {
+		x_printf(LOG_DEBUG, "epoll_wait stdout_done=%d, stderr_done=%d, child_exited=%d", stdout_done, stderr_done, child_exited);
+		int num = epoll_wait(epfd, events, max, -1);
+		x_printf(LOG_INFO, "epoll_wait returned %d, child_exited=%d", num, child_exited);
+
+		if (num == -1) {
+			x_printf(LOG_ERR, "epoll_wait failed: %s", strerror(errno));
+			return exit_steps_server_error;
+		}
+
+		for (int i = 0; i < num; i++) {
+			int fd = events[i].data.fd;
+			const char *source = (fd == rs->pipe_stdout[0]) ? "stdout" :
+				(fd == rs->pipe_stderr[0]) ? "stderr" :
+				(fd == rs->master_fd) ? "master_fd" : "client_fd";
+
+			if (events[i].events & EPOLLIN) {
+				if (fd == rs->client_fd) {
+					int ret = do_client_event(rs);
+					if (ret != exit_steps_success) {
+						return ret;
+					}
+				} else {
+					char data[PAGE_SIZE] = {};
+					while (1) {
+						ssize_t bytes = read(fd, data, sizeof(data));
+						if (bytes > 0) {
+							if (fd == rs->pipe_stdout[0] || fd == rs->pipe_stderr[0])
+								got_cb(private, data, bytes, (fd == rs->pipe_stdout[0]) ? STDOUT_FILENO : STDERR_FILENO);
+							x_printf(LOG_DEBUG, "Received from %s: %s", source, data);
+						} else if (bytes == 0) {
+							/* 写端已关闭，管道无数据 */
+							x_printf(LOG_INFO, "Detected EOF on %s", source);
+							epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+
+							if (fd == rs->pipe_stdout[0])
+								stdout_done = true;
+							else if (fd == rs->pipe_stderr[0])
+								stderr_done = true;
+							else
+								child_exited = true;
+							break;
+						} else if (bytes == -1 && errno == EINTR) {
+							continue;
+						} else if (bytes == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+							/* 非阻塞模式下，暂时没有数据可读 */
+							break;
+						} else {
+							x_printf(LOG_ERR, "Read error on %s: %s", source, strerror(errno));
+							epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+
+							/* 错误处理：PTY 在 EOF 时返回 EIO */
+							if (fd == rs->pipe_stdout[0])
+								stdout_done = true;
+							else if (fd == rs->pipe_stderr[0])
+								stderr_done = true;
+							else
+								child_exited = true;
+							break;
+						}
+					}
+				}
+			}
+
+			if (events[i].events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
+				if (events[i].events & EPOLLERR)
+					x_printf(LOG_INFO, "EPOLLERR detected on %s", source);
+				if (events[i].events & EPOLLHUP)
+					x_printf(LOG_INFO, "EPOLLHUP detected on %s", source);
+				if (events[i].events & EPOLLRDHUP)
+					x_printf(LOG_INFO, "EPOLLRDHUP detected on %s", source);
+
+				epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+
+				if (fd == rs->pipe_stdout[0])
+					stdout_done = true;
+				else if (fd == rs->pipe_stderr[0])
+					stderr_done = true;
+				else if (fd == rs->master_fd)
+					child_exited = true;
+				else
+					return exit_steps_client_error;
+				continue;
+			}
+		}
+	}
+	return exit_steps_success;
+}
 
 /*
  * Executes a command locally, optionally with a PTY.
@@ -146,66 +419,27 @@ typedef void (*CSDO_GOT_CB)(void *private, void *data, uint64_t size, int std_fi
  */
 int do_local_cmd(char **arglist, CSDO_GOT_CB got_cb, void *private, uid_t uid, int no_pty, int client_fd, const char *cwd, struct winsize *ws)
 {
-	int c_out, c_err, c_in;
-	int p_out, p_err, p_in;
-	int out[2], err[2], in[2];
-	pid_t pid;
 	int status;
-	int branch = 0;
+	relay_session_t rs;
 
 	/* 验证 arglist 和 got_cb */
 	if (!arglist || !arglist[0] || !got_cb) {
-		syslog(LOG_ERR, "do_local_cmd: invalid arglist=%p or got_cb=%p", arglist, got_cb);
+		x_printf(LOG_ERR, "do_local_cmd: invalid arglist=%p or got_cb=%p", arglist, got_cb);
 		return -1;
 	}
 
-	if (no_pty) {
-#ifdef USE_PIPES
-		if ((pipe(out) == -1) || (pipe(err) == -1) || (pipe(in) == -1)) {
-			syslog(LOG_CRIT, "pipe: %s", strerror(errno));
-			if (out[0] >= 0) close(out[0]);
-			if (out[1] >= 0) close(out[1]);
-			if (err[0] >= 0) close(err[0]);
-			if (err[1] >= 0) close(err[1]);
-			if (in[0] >= 0) close(in[0]);
-			if (in[1] >= 0) close(in[1]);
-			return -1;
-		}
-		p_out = out[0];
-		p_err = err[0];
-		p_in = in[0];
-		c_out = out[1];
-		c_err = err[1];
-		c_in = in[1];
-#else
-		if (socketpair(AF_UNIX, SOCK_STREAM, 0, out) == -1) {
-			syslog(LOG_CRIT, "socketpair stdout: %s", strerror(errno));
-			return -1;
-		}
-		if (socketpair(AF_UNIX, SOCK_STREAM, 0, err) == -1) {
-			syslog(LOG_CRIT, "socketpair stderr: %s", strerror(errno));
-			close(out[0]);
-			close(out[1]);
-			return -1;
-		}
-		if (socketpair(AF_UNIX, SOCK_STREAM, 0, in) == -1) {
-			syslog(LOG_CRIT, "socketpair stdin: %s", strerror(errno));
-			close(out[0]);
-			close(out[1]);
-			close(err[0]);
-			close(err[1]);
-			return -1;
-		}
-		p_out = out[0];
-		p_err = err[0];
-		p_in = in[0];
-		c_out = out[1];
-		c_err = err[1];
-		c_in = in[1];
-#endif
-		pid = fork();
-	} else {
-		int master;
+	init_relay_session(&rs);
+	rs.client_fd = client_fd;
+	rs.no_pty = no_pty;
+
+	// 创建管道
+	if (create_pipes(&rs) == -1) {
+		cleanup_relay_session(&rs);
+		return -1;
+	}
+
+	if (!no_pty) {
+		char slave_name[128];
 		struct termios term;
 
 		/* 设置默认终端设置 */
@@ -213,267 +447,169 @@ int do_local_cmd(char **arglist, CSDO_GOT_CB got_cb, void *private, uid_t uid, i
 		cfmakeraw(&term);
 		term.c_cc[VMIN] = 1;
 		term.c_cc[VTIME] = 0;
-		syslog(LOG_DEBUG, "do_local_cmd: using raw mode for PTY");
+		x_printf(LOG_DEBUG, "do_local_cmd: using raw mode for PTY");
 
 		/* 使用客户端提供的窗口大小 */
 		struct winsize default_ws = { .ws_row = 24, .ws_col = 80 };
 		if (!ws) {
 			ws = &default_ws;
-			syslog(LOG_WARNING, "do_local_cmd: no window size provided, using default rows=%d, cols=%d", ws->ws_row, ws->ws_col);
+			x_printf(LOG_WARNING, "do_local_cmd: no window size provided, using default rows=%d, cols=%d", ws->ws_row, ws->ws_col);
 		} else {
-			syslog(LOG_DEBUG, "do_local_cmd: window size rows=%d, cols=%d", ws->ws_row, ws->ws_col);
+			x_printf(LOG_DEBUG, "do_local_cmd: window size rows=%d, cols=%d", ws->ws_row, ws->ws_col);
 		}
 
 		/* 创建 PTY 并应用终端设置 */
-		pid = forkpty(&master, NULL, &term, ws);
-		if (pid != -1) {
-			p_out = p_err = p_in = master;
-			c_out = c_err = c_in = master;
-			/* 不设置非阻塞模式以确保同步 I/O */
-			// set_non_blocking(master);
+		if (openpty(&rs.master_fd, &rs.slave_fd, slave_name, &term, ws) == -1) {
+			x_printf(LOG_ERR, "Failed to create PTY: %s", strerror(errno));
+			cleanup_relay_session(&rs);
+			return -1;
 		}
+		fcntl(rs.master_fd, F_SETFD, FD_CLOEXEC); // 设置 master 在 exec 时关闭，保证epoll_wait能收到事件处理EOF
+		fcntl(rs.slave_fd, F_SETFD, FD_CLOEXEC); // 设置 slave 在 exec 时关闭，保证epoll_wait能收到事件处理EOF
+		x_printf(LOG_INFO, "Created PTY %s: master_fd=%d, slave_fd=%d", slave_name, rs.master_fd, rs.slave_fd);
 	}
+
+	// 创建子进程
+	pid_t pid = fork();
 
 	switch (pid) {
 		case -1:
-			if (no_pty) {
-				syslog(LOG_CRIT, "fork: %s", strerror(errno));
-				close(p_out);
-				close(p_err);
-				close(p_in);
-				close(c_out);
-				close(c_err);
-				close(c_in);
-			} else {
-				syslog(LOG_CRIT, "forkpty: %s", strerror(errno));
-			}
+			x_printf(LOG_CRIT, "Fork failed: %s", strerror(errno));
+			cleanup_relay_session(&rs);
 			return -1;
 		case 0:
 			/* Child. */
-			do {
-				if (getpwuid(uid) == NULL) {
-					syslog(LOG_ERR, "do_local_cmd: invalid uid %u for command '%s'", uid, arglist[0]);
-					fprintf(stderr, "Invalid user with UID %u for command '%s'\n", uid, arglist[0]);
-					break;
-				}
-				if (setuid(uid) < 0) {
-					syslog(LOG_ERR, "do_local_cmd: setuid %u for command '%s': %s", uid, arglist[0], strerror(errno));
-					fprintf(stderr, "Failed to switch to user with UID %u for command '%s'\n", uid, arglist[0]);
-					break;
-				}
+			child_process(&rs);
 
-				/* 设置工作目录 */
-				if (cwd && *cwd) {
-					if (chdir(cwd) < 0) {
-						syslog(LOG_ERR, "do_local_cmd: chdir to '%s' failed: %s", cwd, strerror(errno));
-						fprintf(stderr, "Failed to change to directory '%s': %s\n", cwd, strerror(errno));
-						break;
-					}
-					syslog(LOG_DEBUG, "do_local_cmd: changed to cwd='%s'", cwd);
-				}
-
-				/* 设置 TERM 环境变量 */
-				char *term = getenv("TERM");
-				if (term) {
-					setenv("TERM", term, 1);
-					syslog(LOG_DEBUG, "do_local_cmd: set TERM=%s", term);
-				} else {
-					setenv("TERM", "xterm-256color", 1); /* 使用更现代的终端类型 */
-					syslog(LOG_DEBUG, "do_local_cmd: set default TERM=xterm-256color");
-				}
-
-				/* 设置 COLUMNS 和 LINES */
-				if (ws) {
-					char cols[16], rows[16];
-					snprintf(cols, sizeof(cols), "%d", ws->ws_col);
-					snprintf(rows, sizeof(rows), "%d", ws->ws_row);
-					setenv("COLUMNS", cols, 1);
-					setenv("LINES", rows, 1);
-					syslog(LOG_DEBUG, "do_local_cmd: set COLUMNS=%s, LINES=%s", cols, rows);
-				}
-
-				if (no_pty) {
-					if ((dup2(c_in, STDIN_FILENO) == -1) ||
-							(dup2(c_out, STDOUT_FILENO) == -1) ||
-							(dup2(c_err, STDERR_FILENO) == -1)) {
-						syslog(LOG_ERR, "dup2: %s", strerror(errno));
-						break;
-					}
-					close(p_out);
-					close(p_err);
-					close(p_in);
-					close(c_out);
-					close(c_err);
-					close(c_in);
-				}
-
-				/*
-				 * The underlying ssh is in the same process group, so we must
-				 * ignore SIGINT if we want to gracefully abort commands,
-				 * otherwise the signal will make it to the ssh process and
-				 * kill it too. Contrawise, since sftp sends SIGTERMs to the
-				 * underlying ssh, it must *not* ignore that signal.
-				 */
-				ssh_signal(SIGINT, SIG_IGN);
-				ssh_signal(SIGTERM, SIG_DFL);
-				execvp(arglist[0], arglist);
-				syslog(LOG_ERR, "execvp %s: %s", arglist[0], strerror(errno));
-				_exit(EXIT_FAILURE);
-			} while (0);
-
-			if (no_pty) {
-				close(p_out);
-				close(p_err);
-				close(p_in);
-				close(c_out);
-				close(c_err);
-				close(c_in);
+			x_printf(LOG_DEBUG, "do_local_cmd: child cmd=%s", arglist[0]);
+			if (getpwuid(uid) == NULL) {
+				x_printf(LOG_ERR, "do_local_cmd: invalid uid %u for command '%s'", uid, arglist[0]);
+				fprintf(stderr, "Invalid user with UID %u for command '%s'\n", uid, arglist[0]);
+				exit(EXIT_FAILURE);
 			}
-			_exit(EXIT_FAILURE);
+			if (setuid(uid) < 0) {
+				x_printf(LOG_ERR, "do_local_cmd: setuid %u for command '%s': %s", uid, arglist[0], strerror(errno));
+				fprintf(stderr, "Failed to switch to user with UID %u for command '%s'\n", uid, arglist[0]);
+				exit(EXIT_FAILURE);
+			}
+
+			/* 设置工作目录 */
+			if (cwd && *cwd) {
+				if (chdir(cwd) < 0) {
+					x_printf(LOG_ERR, "do_local_cmd: chdir to '%s' failed: %s", cwd, strerror(errno));
+					fprintf(stderr, "Failed to change to directory '%s': %s\n", cwd, strerror(errno));
+					exit(EXIT_FAILURE);
+				}
+				x_printf(LOG_DEBUG, "do_local_cmd: changed to cwd='%s'", cwd);
+			}
+
+			/* 设置 TERM 环境变量 */
+			char *term = getenv("TERM");
+			if (term) {
+				setenv("TERM", term, 1);
+				x_printf(LOG_DEBUG, "do_local_cmd: set TERM=%s", term);
+			} else {
+				setenv("TERM", "xterm-256color", 1); /* 使用更现代的终端类型 */
+				x_printf(LOG_DEBUG, "do_local_cmd: set default TERM=xterm-256color");
+			}
+
+			/* 设置 COLUMNS 和 LINES */
+			if (ws) {
+				char cols[16], rows[16];
+				snprintf(cols, sizeof(cols), "%d", ws->ws_col);
+				snprintf(rows, sizeof(rows), "%d", ws->ws_row);
+				setenv("COLUMNS", cols, 1);
+				setenv("LINES", rows, 1);
+				x_printf(LOG_DEBUG, "do_local_cmd: set COLUMNS=%s, LINES=%s", cols, rows);
+			}
+
+			/*
+			 * The underlying ssh is in the same process group, so we must
+			 * ignore SIGINT if we want to gracefully abort commands,
+			 * otherwise the signal will make it to the ssh process and
+			 * kill it too. Contrawise, since sftp sends SIGTERMs to the
+			 * underlying ssh, it must *not* ignore that signal.
+			 */
+			ssh_signal(SIGINT, SIG_IGN);
+			ssh_signal(SIGTERM, SIG_DFL);
+			execvp(arglist[0], arglist);
+			int exit_code = errno;
+			fprintf(stderr, "execvp %s: %s\n", arglist[0], strerror(exit_code));
+			x_printf(LOG_ERR, "execvp %s: %s", arglist[0], strerror(exit_code));
+			close(STDIN_FILENO);
+			close(STDOUT_FILENO);
+			close(STDERR_FILENO);
+			if (!rs.no_pty) {
+				close(rs.slave_fd);
+				x_printf(LOG_INFO, "Child: Closed slave_fd=%d", rs.slave_fd);
+			}
+			_exit(exit_code);
 		default:
 			/* Parent. Close the other side, and return the local side. */
-			if (no_pty) {
-				close(c_out);
-				close(c_err);
-				close(c_in);
+			if (!rs.no_pty) {
+				close(rs.slave_fd);
+				x_printf(LOG_INFO, "Parent: Closed slave_fd=%d", rs.slave_fd);
+				rs.slave_fd = -1;
 			}
-			set_non_blocking(p_out);
-			set_non_blocking(p_err);
-			if (no_pty) {
-				set_non_blocking(p_in);
+			close(rs.pipe_stdin[0]);
+			x_printf(LOG_INFO, "Parent: Closed pipe_stdin[0]=%d", rs.pipe_stdin[0]);
+			rs.pipe_stdin[0] = -1;
+			close(rs.pipe_stdout[1]);
+			x_printf(LOG_INFO, "Parent: Closed pipe_stdout[1]=%d", rs.pipe_stdout[1]);
+			rs.pipe_stdout[1] = -1;
+			close(rs.pipe_stderr[1]);
+			x_printf(LOG_INFO, "Parent: Closed pipe_stderr[1]=%d", rs.pipe_stderr[1]);
+			rs.pipe_stderr[1] = -1;
+
+			// 设置文件描述符为非阻塞
+			if (set_nonblocking(rs.pipe_stdout[0], "pipe_stdout[0]") == -1 ||
+					set_nonblocking(rs.pipe_stderr[0], "pipe_stderr[0]") == -1 ||
+					set_nonblocking(rs.client_fd, "client_fd") == -1) {
+				cleanup_relay_session(&rs);
+				return -1;
 			}
-
-			char data[PAGE_SIZE];
-			bool out_finish = false;
-			bool err_finish = false;
-			int efds[3] = {};
-			int idxs = 0;
-			int i;
-
-			do {
-				if (out_finish && err_finish)
-					break;
-
-				idxs = 0;
-				if (!out_finish)
-					efds[idxs++] = p_out;
-				if (!err_finish)
-					efds[idxs++] = p_err;
-				efds[idxs++] = client_fd;
-				idxs = poll_wait(efds, idxs, -1);
-
-				if (idxs < 0) {
-					syslog(LOG_ERR, "do_local_cmd: poll_wait failed: %s", strerror(errno));
-					goto server_error_out;
-				}
-
-				for (i = 0; i < idxs; i++) {
-					if (efds[i] == client_fd) {
-						struct csdo_request_header rqh = {};
-						int rv = do_read(client_fd, &rqh, sizeof(rqh));
-						if (rv < 0) {
-							syslog(LOG_INFO, "do_local_cmd: client disconnected: %s", strerror(errno));
-							goto client_error_out; /* 客户端断开，直接清理 */
-						}
-						if (rqh.bh.magic != CSDO_QUERY_MAGIC) {
-							syslog(LOG_ERR, "do_local_cmd: invalid request magic: %u", rqh.bh.magic);
-							goto client_error_out;
-						}
-						if (rqh.type == CSDO_MSG_WINSIZE) {
-							/* 处理窗口大小更新 */
-							if (!no_pty) {
-								if (ioctl(p_out, TIOCSWINSZ, &rqh.ws) == -1) {
-									syslog(LOG_ERR, "do_local_cmd: ioctl TIOCSWINSZ failed: %s", strerror(errno));
-								} else {
-									syslog(LOG_DEBUG, "do_local_cmd: updated window size rows=%d, cols=%d", rqh.ws.ws_row, rqh.ws.ws_col);
-								}
-							}
-							continue;
-						}
-						if (rqh.type != CSDO_MSG_OPERATE) {
-							syslog(LOG_ERR, "do_local_cmd: invalid request type %d", rqh.type);
-							goto client_error_out;
-						}
-						if (rqh.length == 0) {
-							syslog(LOG_INFO, "do_local_cmd: client sent empty command");
-							goto client_error_out;
-						}
-						if (rqh.std_fileno != STDIN_FILENO) {
-							syslog(LOG_ERR, "do_local_cmd: invalid std_fileno %d", rqh.std_fileno);
-							goto client_error_out;
-						}
-						uint64_t len = rqh.length;
-						while (len) {
-							int todo = MIN(len, PAGE_SIZE);
-							rv = do_read(client_fd, data, todo);
-							if (rv < 0) {
-								syslog(LOG_INFO, "do_local_cmd: read client data failed: %s", strerror(errno));
-								goto client_error_out;
-							}
-							rv = do_write(p_in, data, todo);
-							if (rv < 0) {
-								syslog(LOG_ERR, "do_local_cmd: write stdin: %s", strerror(errno));
-								goto child_error_out;
-							}
-							len -= todo;
-						}
-					} else {
-						do {
-							int bytes = read(efds[i], data, sizeof(data));
-							if (bytes > 0) {
-								got_cb(private, data, bytes, (efds[i] == p_out) ? STDOUT_FILENO : STDERR_FILENO);
-							} else if (bytes == 0) {
-								/* 写端已关闭，管道无数据 */
-								if (no_pty) {
-									if (efds[i] == p_out)
-										out_finish = true;
-									else
-										err_finish = true;
-								} else {
-									out_finish = true;
-									err_finish = true;
-								}
-								break;
-							} else if (bytes == -1 && (errno == EAGAIN || errno == EINTR)) {
-								/* 非阻塞模式下，暂时没有数据可读 */
-								break;
-							} else {
-								/* 错误处理：兼容 PTY 在 EOF 时返回 EIO 的情况 */
-								if (errno == EIO && no_pty == 0) {
-									/* PTY 模式下，EIO 表示 EOF，可视作读完 */
-									out_finish = true;
-									err_finish = true;
-									break;
-								} else {
-									/* 其他错误 */
-									syslog(LOG_ERR, "do_local_cmd: read fd %d: %s", efds[i], strerror(errno));
-									goto child_error_out;
-								}
-							}
-						} while (1);
-					}
-				}
-			} while (1);
-
-child_error_out:
-			branch++;
-client_error_out:
-			branch++;
-server_error_out:
-
-			if (no_pty) {
-				close(p_out);
-				close(p_err);
-				close(p_in);
-			} else {
-				close(p_out);
-			}
-
-			switch (branch) {
-				case 0:
+			if (!rs.no_pty) {
+				if (set_nonblocking(rs.master_fd, "master_fd") == -1) {
+					cleanup_relay_session(&rs);
 					return -1;
-				case 1:
-					syslog(LOG_INFO, "do_local_cmd: terminating child pid %d due to client disconnect", pid);
+				}
+			}
+
+			// 创建 epoll 实例
+			rs.epoll_fd = epoll_create1(0);
+			if (rs.epoll_fd == -1) {
+				x_printf(LOG_ERR, "epoll_create1 failed: %s", strerror(errno));
+				cleanup_relay_session(&rs);
+				return -1;
+			}
+			x_printf(LOG_INFO, "Parent: Created epoll instance, epoll_fd=%d", rs.epoll_fd);
+
+			// 注册文件描述符到 epoll
+			if (register_epoll(rs.epoll_fd, rs.pipe_stdout[0], "pipe_stdout[0]") == -1 ||
+					register_epoll(rs.epoll_fd, rs.pipe_stderr[0], "pipe_stderr[0]") == -1 ||
+					register_epoll(rs.epoll_fd, rs.client_fd, "client_fd") == -1) {
+				cleanup_relay_session(&rs);
+				return -1;
+			}
+			if (!rs.no_pty) {
+				if (register_epoll(rs.epoll_fd, rs.master_fd, "master_fd") == -1) {
+					cleanup_relay_session(&rs);
+					return -1;
+				}
+			}
+
+			x_printf(LOG_DEBUG, "do_local_cmd: parent cmd=%s", arglist[0]);
+			// 处理 epoll 事件
+			int exit_steps = handle_epoll_events(rs.epoll_fd, &rs, got_cb, private);
+
+			// 清理资源
+			cleanup_relay_session(&rs);
+
+			switch (exit_steps) {
+				case exit_steps_server_error:
+					return -1;
+				case exit_steps_client_error:
+					x_printf(LOG_INFO, "do_local_cmd: terminating child pid %d due to client disconnect", pid);
 					kill(pid, SIGTERM);
 					struct timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
 					nanosleep(&ts, NULL);
@@ -483,34 +619,33 @@ server_error_out:
 						/* 子进程状态已变化 */
 					} else if (ret == 0) {
 						/* 子进程尚未退出 */
-						syslog(LOG_WARNING, "do_local_cmd: child pid %d did not terminate, sending SIGKILL", pid);
+						x_printf(LOG_WARNING, "do_local_cmd: child pid %d did not terminate, sending SIGKILL", pid);
 						kill(pid, SIGKILL);
 						while (waitpid(pid, &status, 0) == -1) {
 							if (errno != EINTR) {
-								syslog(LOG_CRIT, "do_local_cmd: waitpid: %s", strerror(errno));
+								x_printf(LOG_CRIT, "do_local_cmd: waitpid: %s", strerror(errno));
 								return -1;
 							}
 						}
 					} else {
 						/* waitpid 出错 */
 						if (errno == ECHILD) {
-							syslog(LOG_ERR, "do_local_cmd: waitpid: No child process (pid %d), possibly already reaped, fd %d", pid, efds[i]);
+							x_printf(LOG_ERR, "do_local_cmd: waitpid: No child process (pid %d), possibly already reaped", pid);
 						} else {
-							syslog(LOG_ERR, "do_local_cmd: waitpid error for pid %d, fd %d: %s", pid, efds[i], strerror(errno));
+							x_printf(LOG_ERR, "do_local_cmd: waitpid error for pid %d: %s", pid, strerror(errno));
 						}
 						return -1;
 					}
 					break;
-				case 2:
+				case exit_steps_child_error:
+				default:
 					while (waitpid(pid, &status, 0) == -1) {
 						if (errno != EINTR) {
-							syslog(LOG_CRIT, "do_local_cmd: waitpid: %s", strerror(errno));
+							x_printf(LOG_CRIT, "do_local_cmd: waitpid: %s", strerror(errno));
 							return -1;
 						}
 					}
 					break;
-				default:
-					abort();
 			}
 
 			/* 检查子进程状态 */
@@ -518,21 +653,21 @@ server_error_out:
 				/* 子进程正常退出 */
 				int code = WEXITSTATUS(status);
 				if (code == 0) {
-					syslog(LOG_DEBUG, "do_local_cmd: child pid %d exited normally, fd %d", pid, efds[i]);
+					x_printf(LOG_DEBUG, "do_local_cmd: child pid %d exited normally", pid);
 				} else {
-					syslog(LOG_ERR, "do_local_cmd: child pid %d exited with non-zero status %d, fd %d", pid, code, efds[i]);
+					x_printf(LOG_ERR, "do_local_cmd: child pid %d exited with non-zero status %d", pid, code);
 				}
 				return code;
 			} else if (WIFSIGNALED(status)) {
 				/* 子进程被信号终止 */
-				syslog(LOG_WARNING, "Child killed by signal %d", WTERMSIG(status));
+				x_printf(LOG_WARNING, "Child killed by signal %d", WTERMSIG(status));
 				return EXIT_FAILURE;
 			} else if (WIFSTOPPED(status)) {
-				syslog(LOG_WARNING, "Child stopped by signal %d", WSTOPSIG(status));
+				x_printf(LOG_WARNING, "Child stopped by signal %d", WSTOPSIG(status));
 				return EXIT_FAILURE;
 			} else {
 				/* 子进程异常退出 */
-				syslog(LOG_ERR, "do_local_cmd: child pid %d exited abnormally (unknown status), fd %d", pid, efds[i]);
+				x_printf(LOG_ERR, "do_local_cmd: child pid %d exited abnormally (unknown status)", pid);
 				return EXIT_FAILURE;
 			}
 	}
@@ -557,15 +692,15 @@ static int setup_listener(const char *sock_path)
 	/* Try to acquire lock */
 	lock_fd = open(lock_path, O_CREAT | O_WRONLY, 0600);
 	if (lock_fd < 0) {
-		syslog(LOG_ERR, "open lock file %s: error %d: %s", lock_path, errno, strerror(errno));
+		x_printf(LOG_ERR, "open lock file %s: error %d: %s", lock_path, errno, strerror(errno));
 		return -1;
 	}
 
 	if (flock(lock_fd, LOCK_EX | LOCK_NB) < 0) {
 		if (errno == EWOULDBLOCK) {
-			syslog(LOG_ERR, "Another instance is already running (lock file %s)", lock_path);
+			x_printf(LOG_ERR, "Another instance is already running (lock file %s)", lock_path);
 		} else {
-			syslog(LOG_ERR, "flock %s: error %d: %s", lock_path, errno, strerror(errno));
+			x_printf(LOG_ERR, "flock %s: error %d: %s", lock_path, errno, strerror(errno));
 		}
 		close(lock_fd);
 		return -1;
@@ -574,7 +709,7 @@ static int setup_listener(const char *sock_path)
 	/* we listen for new client connections on socket sd */
 	sd = socket(AF_LOCAL, SOCK_STREAM, 0);
 	if (sd < 0) {
-		syslog(LOG_ERR, "socket: error %d: %s", sd, strerror(errno));
+		x_printf(LOG_ERR, "socket: error %d: %s", sd, strerror(errno));
 		close(lock_fd);
 		return sd;
 	}
@@ -587,7 +722,7 @@ static int setup_listener(const char *sock_path)
 
 	rv = bind(sd, (struct sockaddr *)&addr, addrlen);
 	if (rv < 0) {
-		syslog(LOG_ERR, "bind: error %d: %s", rv, strerror(errno));
+		x_printf(LOG_ERR, "bind: error %d: %s", rv, strerror(errno));
 		close(sd);
 		close(lock_fd);
 		return rv;
@@ -595,7 +730,7 @@ static int setup_listener(const char *sock_path)
 
 	rv = listen(sd, 5);
 	if (rv < 0) {
-		syslog(LOG_ERR, "listen: error %d: %s", rv, strerror(errno));
+		x_printf(LOG_ERR, "listen: error %d: %s", rv, strerror(errno));
 		close(sd);
 		close(lock_fd);
 		return rv;
@@ -604,7 +739,7 @@ static int setup_listener(const char *sock_path)
 	/* Set socket file permissions for group access */
 	rv = chmod(sock_path, 0660);
 	if (rv < 0) {
-		syslog(LOG_ERR, "chmod: error %d: %s", rv, strerror(errno));
+		x_printf(LOG_ERR, "chmod: error %d: %s", rv, strerror(errno));
 		close(sd);
 		close(lock_fd);
 		return rv;
@@ -620,16 +755,16 @@ static int setup_listener(const char *sock_path)
 	}
 
 	if (!grp) {
-		syslog(LOG_ERR, "chown: no suitable group found (tried sudo, wheel)");
+		x_printf(LOG_ERR, "chown: no suitable group found (tried sudo, wheel)");
 		close(sd);
 		close(lock_fd);
 		return -1;
 	}
 
-	syslog(LOG_INFO, "Using group '%s' (gid %d) for socket permissions", group_name, grp->gr_gid);
+	x_printf(LOG_INFO, "Using group '%s' (gid %d) for socket permissions", group_name, grp->gr_gid);
 	rv = chown(sock_path, 0, grp->gr_gid);
 	if (rv < 0) {
-		syslog(LOG_ERR, "chown: error %d: %s", rv, strerror(errno));
+		x_printf(LOG_ERR, "chown: error %d: %s", rv, strerror(errno));
 		close(sd);
 		close(lock_fd);
 		return rv;
@@ -650,12 +785,12 @@ static void csdo_got_cb(void *private, void *data, uint64_t size, int std_fileno
 {
 	int *fd_ptr = (int *)private;
 	if (!fd_ptr) {
-		syslog(LOG_ERR, "csdo_got_cb: null private pointer");
+		x_printf(LOG_ERR, "csdo_got_cb: null private pointer");
 		return;
 	}
 	int fd = *fd_ptr;
 	if (fd < 0) {
-		syslog(LOG_ERR, "csdo_got_cb: invalid fd %d", fd);
+		x_printf(LOG_ERR, "csdo_got_cb: invalid fd %d", fd);
 		return;
 	}
 
@@ -665,12 +800,12 @@ static void csdo_got_cb(void *private, void *data, uint64_t size, int std_fileno
 	rph.std_fileno = std_fileno;
 	int rv = do_write(fd, &rph, sizeof(rph));
 	if (rv < 0) {
-		syslog(LOG_ERR, "csdo_got_cb: write header failed: %s", strerror(errno));
+		x_printf(LOG_ERR, "csdo_got_cb: write header failed: %s", strerror(errno));
 		return;
 	}
 	rv = do_write(fd, data, size);
 	if (rv < 0) {
-		syslog(LOG_ERR, "csdo_got_cb: write data failed: %s", strerror(errno));
+		x_printf(LOG_ERR, "csdo_got_cb: write data failed: %s", strerror(errno));
 	}
 }
 
@@ -688,20 +823,20 @@ static void do_query_work(int fd, char *cmd, uint64_t len, uid_t uid, int no_pty
 	struct cmd_arg_list list = {};
 
 	if (len > 0 && !cmd) {
-		syslog(LOG_ERR, "do_query_work: null cmd with non-zero len=%lu", len);
+		x_printf(LOG_ERR, "do_query_work: null cmd with non-zero len=%lu", len);
 		return;
 	}
 
 	if (cmd_decode(&list, cmd, len) < 0) {
-		syslog(LOG_ERR, "do_query_work: cmd_decode failed");
+		x_printf(LOG_ERR, "do_query_work: cmd_decode failed");
 		return;
 	}
 
 	for (int i = 0; i < list.argc; i++) {
-		syslog(LOG_DEBUG, "arg %d: %s", i, list.argv[i] ? list.argv[i] : "(null)");
+		x_printf(LOG_DEBUG, "arg %d: %s", i, list.argv[i] ? list.argv[i] : "(null)");
 	}
 	if (list.cwd) {
-		syslog(LOG_DEBUG, "do_query_work: cwd='%s'", list.cwd);
+		x_printf(LOG_DEBUG, "do_query_work: cwd='%s'", list.cwd);
 	}
 
 	int result = do_local_cmd(list.argv, csdo_got_cb, (void *)&fd, uid, no_pty, fd, list.cwd, ws);
@@ -725,7 +860,7 @@ static void *csdo_query_handle(void *arg)
 	char *extra = NULL;
 
 	if (fd < 0) {
-		syslog(LOG_ERR, "csdo_query_handle: invalid fd %d", fd);
+		x_printf(LOG_ERR, "csdo_query_handle: invalid fd %d", fd);
 		pthread_exit(0);
 	}
 
@@ -735,37 +870,37 @@ static void *csdo_query_handle(void *arg)
 	}
 
 	if (rqh.bh.magic != CSDO_QUERY_MAGIC) {
-		syslog(LOG_ERR, "Invalid magic number: %u", rqh.bh.magic);
+		x_printf(LOG_ERR, "Invalid magic number: %u", rqh.bh.magic);
 		goto out;
 	}
 
 	if ((rqh.bh.version & 0xFFFF0000) != (CSDO_QUERY_VERSION & 0xFFFF0000)) {
-		syslog(LOG_ERR, "Invalid version: %u", rqh.bh.version);
+		x_printf(LOG_ERR, "Invalid version: %u", rqh.bh.version);
 		goto out;
 	}
 
 	if (rqh.type == CSDO_MSG_WINSIZE) {
 		/* 不应在连接初始化时收到窗口大小更新 */
-		syslog(LOG_ERR, "csdo_query_handle: unexpected winsize message at connection start");
+		x_printf(LOG_ERR, "csdo_query_handle: unexpected winsize message at connection start");
 		goto out;
 	}
 
 	if (rqh.type != CSDO_MSG_COMMAND) {
-		syslog(LOG_ERR, "csdo_query_handle: invalid request type %d", rqh.type);
+		x_printf(LOG_ERR, "csdo_query_handle: invalid request type %d", rqh.type);
 		goto out;
 	}
 
 	if (rqh.length > 0) {
 		extra = malloc(rqh.length);
 		if (!extra) {
-			syslog(LOG_ERR, "csdo_query_handle: no memory for %lu bytes", rqh.length);
+			x_printf(LOG_ERR, "csdo_query_handle: no memory for %lu bytes", rqh.length);
 			goto out;
 		}
 		memset(extra, 0, rqh.length);
 
 		rv = do_read(fd, extra, rqh.length);
 		if (rv < 0) {
-			syslog(LOG_DEBUG, "connection %d: extra read error %d", fd, rv);
+			x_printf(LOG_DEBUG, "connection %d: extra read error %d", fd, rv);
 			goto out;
 		}
 	}
@@ -792,13 +927,13 @@ static void *csdo_query_process(void)
 
 	/* Check if running as root */
 	if (geteuid() != 0) {
-		syslog(LOG_CRIT, "csdod must run as root");
+		x_printf(LOG_CRIT, "csdod must run as root");
 		return NULL;
 	}
 
 	/* 忽略 SIGPIPE 信号以防止客户端断开时进程终止 */
 	if (ssh_signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
-		syslog(LOG_CRIT, "Failed to ignore SIGPIPE: %s", strerror(errno));
+		x_printf(LOG_CRIT, "Failed to ignore SIGPIPE: %s", strerror(errno));
 		return NULL;
 	}
 
@@ -812,13 +947,13 @@ static void *csdo_query_process(void)
 			if (errno == EINTR) {
 				continue; /* 忽略中断 */
 			}
-			syslog(LOG_ERR, "accept: %s", strerror(errno));
+			x_printf(LOG_ERR, "accept: %s", strerror(errno));
 			continue;
 		}
 
 		rv = pthread_create(&thread, NULL, csdo_query_handle, (void *)(uintptr_t)fd);
 		if (rv < 0) {
-			syslog(LOG_CRIT, "pthread_create failed: %s", strerror(errno));
+			x_printf(LOG_CRIT, "pthread_create failed: %s", strerror(errno));
 			close(fd);
 		} else {
 			pthread_detach(thread); /* Detach thread to avoid resource leak */
@@ -830,9 +965,8 @@ static void *csdo_query_process(void)
 
 int main(int argc, char **argv)
 {
-	openlog("csdod", LOG_PID | LOG_CONS, LOG_DAEMON);
+	x_set_log_level(LOG_INFO);
 	daemon(0, 0);
 	csdo_query_process();
-	closelog();
 	return 0;
 }

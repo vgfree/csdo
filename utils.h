@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <syslog.h>
 #include <poll.h>
+#include "x_printf.h"
 
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define ARG_MAX          4096
@@ -80,15 +81,15 @@ static inline int cmd_encode(struct cmd_arg_list *list, char *data, uint32_t *si
 
 	/* 输入验证 */
 	if (!list || list->argc < 1) {
-		syslog(LOG_ERR, "cmd_encode: invalid list or argc=%d", list ? list->argc : -1);
+		x_printf(LOG_ERR, "cmd_encode: invalid list or argc=%d", list ? list->argc : -1);
 		return -1;
 	}
 	if (list->argc > ARG_MAX) {
-		syslog(LOG_ERR, "cmd_encode: argc %d exceeds ARG_MAX %d", list->argc, ARG_MAX);
+		x_printf(LOG_ERR, "cmd_encode: argc %d exceeds ARG_MAX %d", list->argc, ARG_MAX);
 		return -1;
 	}
 	if (list->cwd && strlen(list->cwd) >= CSDO_CWD_MAX) {
-		syslog(LOG_ERR, "cmd_encode: cwd too long (%zu >= %d)", strlen(list->cwd), CSDO_CWD_MAX);
+		x_printf(LOG_ERR, "cmd_encode: cwd too long (%zu >= %d)", strlen(list->cwd), CSDO_CWD_MAX);
 		return -1;
 	}
 
@@ -103,14 +104,14 @@ static inline int cmd_encode(struct cmd_arg_list *list, char *data, uint32_t *si
 
 	if (!data) {
 		*size = total_size;
-		syslog(LOG_DEBUG, "cmd_encode: calculated size=%u", total_size);
+		x_printf(LOG_DEBUG, "cmd_encode: calculated size=%u", total_size);
 		return 0;
 	}
 
 	/* 编码数据 */
 	psize = (uint32_t *)data;
 	*psize = list->argc;
-	syslog(LOG_DEBUG, "cmd_encode: encoded argc=%d", list->argc);
+	x_printf(LOG_DEBUG, "cmd_encode: encoded argc=%d", list->argc);
 	psize++;
 	done += sizeof(uint32_t);
 
@@ -118,7 +119,7 @@ static inline int cmd_encode(struct cmd_arg_list *list, char *data, uint32_t *si
 	for (i = 0; i < list->argc; i++) {
 		uint32_t arg_len = strlen(list->argv[i]) + 1;
 		*psize = arg_len;
-		syslog(LOG_DEBUG, "cmd_encode: encoded argv[%d] length=%u", i, arg_len);
+		x_printf(LOG_DEBUG, "cmd_encode: encoded argv[%d] length=%u", i, arg_len);
 		psize++;
 		done += sizeof(uint32_t);
 	}
@@ -126,7 +127,7 @@ static inline int cmd_encode(struct cmd_arg_list *list, char *data, uint32_t *si
 	/* 编码 cwd 长度 */
 	uint32_t cwd_len = list->cwd ? strlen(list->cwd) + 1 : 0;
 	*psize = cwd_len;
-	syslog(LOG_DEBUG, "cmd_encode: encoded cwd length=%u", cwd_len);
+	x_printf(LOG_DEBUG, "cmd_encode: encoded cwd length=%u", cwd_len);
 	psize++;
 	done += sizeof(uint32_t);
 
@@ -135,7 +136,7 @@ static inline int cmd_encode(struct cmd_arg_list *list, char *data, uint32_t *si
 	for (i = 0; i < list->argc; i++) {
 		uint32_t arg_len = strlen(list->argv[i]) + 1;
 		memcpy(pdata, list->argv[i], arg_len);
-		syslog(LOG_DEBUG, "cmd_encode: encoded argv[%d]='%s'", i, pdata);
+		x_printf(LOG_DEBUG, "cmd_encode: encoded argv[%d]='%s'", i, pdata);
 		pdata += arg_len;
 		done += arg_len;
 	}
@@ -143,12 +144,12 @@ static inline int cmd_encode(struct cmd_arg_list *list, char *data, uint32_t *si
 	/* 编码 cwd 字符串 */
 	if (cwd_len > 0) {
 		memcpy(pdata, list->cwd, cwd_len);
-		syslog(LOG_DEBUG, "cmd_encode: encoded cwd='%s'", pdata);
+		x_printf(LOG_DEBUG, "cmd_encode: encoded cwd='%s'", pdata);
 		done += cwd_len;
 	}
 
 	*size = done;
-	syslog(LOG_DEBUG, "cmd_encode: total encoded size=%u", done);
+	x_printf(LOG_DEBUG, "cmd_encode: total encoded size=%u", done);
 	return 0;
 }
 
@@ -173,7 +174,7 @@ static inline int cmd_decode(struct cmd_arg_list *list, char *data, uint32_t siz
 
 	/* 输入验证 */
 	if (!data || size < sizeof(uint32_t)) {
-		syslog(LOG_ERR, "cmd_decode: invalid buffer or size (%u < %zu)", size, sizeof(uint32_t));
+		x_printf(LOG_ERR, "cmd_decode: invalid buffer or size (%u < %zu)", size, sizeof(uint32_t));
 		return -1;
 	}
 
@@ -181,7 +182,7 @@ static inline int cmd_decode(struct cmd_arg_list *list, char *data, uint32_t siz
 	psize = (uint32_t *)data;
 	list->argc = *psize;
 	if (list->argc < 1 || list->argc > ARG_MAX) {
-		syslog(LOG_ERR, "cmd_decode: invalid argc=%d", list->argc);
+		x_printf(LOG_ERR, "cmd_decode: invalid argc=%d", list->argc);
 		return -1;
 	}
 	psize++;
@@ -189,7 +190,7 @@ static inline int cmd_decode(struct cmd_arg_list *list, char *data, uint32_t siz
 
 	/* 验证缓冲区大小 */
 	if (size < done + list->argc * sizeof(uint32_t) + sizeof(uint32_t)) {
-		syslog(LOG_ERR, "cmd_decode: buffer too small (%u < %lu)", size,
+		x_printf(LOG_ERR, "cmd_decode: buffer too small (%u < %lu)", size,
 				done + list->argc * sizeof(uint32_t) + sizeof(uint32_t));
 		return -1;
 	}
@@ -199,7 +200,7 @@ static inline int cmd_decode(struct cmd_arg_list *list, char *data, uint32_t siz
 	for (i = 0; i < list->argc; i++) {
 		arg_len[i] = *psize;
 		if (arg_len[i] == 0 || arg_len[i] > size) {
-			syslog(LOG_ERR, "cmd_decode: invalid arg_len[%d]=%u", i, arg_len[i]);
+			x_printf(LOG_ERR, "cmd_decode: invalid arg_len[%d]=%u", i, arg_len[i]);
 			return -1;
 		}
 		psize++;
@@ -209,7 +210,7 @@ static inline int cmd_decode(struct cmd_arg_list *list, char *data, uint32_t siz
 	/* 解码 cwd 长度 */
 	uint32_t cwd_len = *psize;
 	if (cwd_len >= CSDO_CWD_MAX) {
-		syslog(LOG_ERR, "cmd_decode: cwd_len=%u exceeds CSDO_CWD_MAX=%d", cwd_len, CSDO_CWD_MAX);
+		x_printf(LOG_ERR, "cmd_decode: cwd_len=%u exceeds CSDO_CWD_MAX=%d", cwd_len, CSDO_CWD_MAX);
 		return -1;
 	}
 	psize++;
@@ -222,7 +223,7 @@ static inline int cmd_decode(struct cmd_arg_list *list, char *data, uint32_t siz
 	}
 	total_len += cwd_len;
 	if (total_len > size) {
-		syslog(LOG_ERR, "cmd_decode: total length %u exceeds buffer size %u", total_len, size);
+		x_printf(LOG_ERR, "cmd_decode: total length %u exceeds buffer size %u", total_len, size);
 		return -1;
 	}
 
@@ -231,11 +232,11 @@ static inline int cmd_decode(struct cmd_arg_list *list, char *data, uint32_t siz
 	for (i = 0; i < list->argc; i++) {
 		/* 验证字符串长度和 NUL 终止 */
 		if (pdata[arg_len[i] - 1] != '\0') {
-			syslog(LOG_ERR, "cmd_decode: arg %d not null-terminated", i);
+			x_printf(LOG_ERR, "cmd_decode: arg %d not null-terminated", i);
 			return -1;
 		}
 		list->argv[i] = pdata;
-		syslog(LOG_DEBUG, "cmd_decode: decoded argv[%d]='%s'", i, list->argv[i]);
+		x_printf(LOG_DEBUG, "cmd_decode: decoded argv[%d]='%s'", i, list->argv[i]);
 		pdata += arg_len[i];
 		done += arg_len[i];
 	}
@@ -243,15 +244,15 @@ static inline int cmd_decode(struct cmd_arg_list *list, char *data, uint32_t siz
 	/* 解码 cwd 字符串 */
 	if (cwd_len > 0) {
 		if (pdata[cwd_len - 1] != '\0') {
-			syslog(LOG_ERR, "cmd_decode: cwd not null-terminated");
+			x_printf(LOG_ERR, "cmd_decode: cwd not null-terminated");
 			return -1;
 		}
 		list->cwd = pdata;
 		done += cwd_len;
-		syslog(LOG_DEBUG, "cmd_decode: decoded cwd='%s'", list->cwd);
+		x_printf(LOG_DEBUG, "cmd_decode: decoded cwd='%s'", list->cwd);
 	}
 
-	syslog(LOG_DEBUG, "cmd_decode: total decoded size=%u", done);
+	x_printf(LOG_DEBUG, "cmd_decode: total decoded size=%u", done);
 	return 0;
 }
 
@@ -267,38 +268,52 @@ static inline int do_read(int fd, void *buf, size_t count)
 	struct pollfd pfd;
 
 	if (!buf) {
-		syslog(LOG_ERR, "do_read: null buffer");
+		x_printf(LOG_ERR, "do_read: null buffer for fd %d", fd);
 		return -1;
 	}
-
-	pfd.fd = fd;
-	pfd.events = POLLIN;
+	if (fd < 0) {
+		x_printf(LOG_ERR, "do_read: invalid file descriptor %d", fd);
+		return -1;
+	}
+	if (count == 0) {
+		return 0; /* No-op for zero bytes */
+	}
 
 	while (off < count) {
 		rv = read(fd, (char *)buf + off, count - off);
 		if (rv == 0) {
-			syslog(LOG_ERR, "do_read: connection closed");
+			x_printf(LOG_ERR, "do_read: EOF or connection closed for fd %d", fd);
 			return -1;
 		}
 		if (rv == -1 && errno == EINTR) {
 			continue;
 		}
 		if (rv == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-			rv = poll(&pfd, 1, -1);
+			pfd.fd = fd;
+			pfd.events = POLLIN;
+			rv = poll(&pfd, 1, -1); /* Infinite timeout */
 			if (rv < 0) {
 				if (errno == EINTR)
 					continue;
-				syslog(LOG_ERR, "do_read: poll: %s", strerror(errno));
+				x_printf(LOG_ERR, "do_read: poll failed for fd %d: %s", fd, strerror(errno));
 				return -1;
 			}
-			if (rv == 0 || !(pfd.revents & POLLIN)) {
-				syslog(LOG_ERR, "do_read: poll returned no POLLIN event");
+			if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+				x_printf(LOG_ERR, "do_read: poll error on fd %d: %s%s%s",
+						fd,
+						(pfd.revents & POLLERR) ? "POLLERR " : "",
+						(pfd.revents & POLLHUP) ? "POLLHUP " : "",
+						(pfd.revents & POLLNVAL) ? "POLLNVAL" : "");
+				return -1;
+			}
+			if (!(pfd.revents & POLLIN)) {
+				x_printf(LOG_ERR, "do_read: poll did not return POLLIN for fd %d", fd);
 				return -1;
 			}
 			continue;
 		}
-		if (rv == -1) {
-			syslog(LOG_ERR, "do_read: %s", strerror(errno));
+		if (rv < 0) {
+			x_printf(LOG_ERR, "do_read: read failed for fd %d: %s", fd, strerror(errno));
 			return -1;
 		}
 		off += rv;
@@ -318,39 +333,75 @@ static inline int do_write(int fd, void *buf, size_t count)
 	struct pollfd pfd;
 
 	if (!buf) {
-		syslog(LOG_ERR, "do_write: null buffer");
+		x_printf(LOG_ERR, "do_write: null buffer for fd %d", fd);
 		return -1;
 	}
-
-	pfd.fd = fd;
-	pfd.events = POLLOUT;
+	if (fd < 0) {
+		x_printf(LOG_ERR, "do_write: invalid file descriptor %d", fd);
+		return -1;
+	}
+	if (count == 0) {
+		return 0; /* No-op for zero bytes */
+	}
 
 	while (off < count) {
 		rv = write(fd, (char *)buf + off, count - off);
+		if (rv == 0) {
+			x_printf(LOG_ERR, "do_write: write returned 0 for fd %d", fd);
+			return -1;
+		}
 		if (rv == -1 && errno == EINTR) {
 			continue;
 		}
 		if (rv == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-			rv = poll(&pfd, 1, -1);
+			pfd.fd = fd;
+			pfd.events = POLLOUT;
+			rv = poll(&pfd, 1, -1); /* Infinite timeout */
 			if (rv < 0) {
 				if (errno == EINTR)
 					continue;
-				syslog(LOG_ERR, "do_write: poll: %s", strerror(errno));
+				x_printf(LOG_ERR, "do_write: poll failed for fd %d: %s", fd, strerror(errno));
 				return -1;
 			}
-			if (rv == 0 || !(pfd.revents & POLLOUT)) {
-				syslog(LOG_ERR, "do_write: poll returned no POLLOUT event");
+			if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+				x_printf(LOG_ERR, "do_write: poll error on fd %d: %s%s%s",
+						fd,
+						(pfd.revents & POLLERR) ? "POLLERR " : "",
+						(pfd.revents & POLLHUP) ? "POLLHUP " : "",
+						(pfd.revents & POLLNVAL) ? "POLLNVAL" : "");
+				return -1;
+			}
+			if (!(pfd.revents & POLLOUT)) {
+				x_printf(LOG_ERR, "do_write: poll did not return POLLOUT for fd %d", fd);
 				return -1;
 			}
 			continue;
 		}
 		if (rv < 0) {
-			syslog(LOG_ERR, "do_write: %s", strerror(errno));
-			return rv;
+			x_printf(LOG_ERR, "do_write: write failed for fd %d: %s", fd, strerror(errno));
+			return -1;
 		}
 		off += rv;
 	}
 	return 0;
 }
 
+/*
+ * Sets a file descriptor to non-blocking mode.
+ */
+static inline int set_nonblocking(int fd, const char *name)
+{
+	int flags = fcntl(fd, F_GETFL, 0);
+	if (flags == -1) {
+		x_printf(LOG_ERR, "Failed to get %s=%d flags: %s", name, fd, strerror(errno));
+		return -1;
+	}
+	flags |= O_NONBLOCK;
+	if (fcntl(fd, F_SETFL, flags) == -1) {
+		x_printf(LOG_ERR, "Failed to set %s=%d to non-blocking: %s", name, fd, strerror(errno));
+		return -1;
+	}
+	x_printf(LOG_DEBUG, "Set %s=%d to non-blocking", name, fd);
+	return 0;
+}
 #endif
