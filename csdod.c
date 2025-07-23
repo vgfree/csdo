@@ -28,6 +28,7 @@
 #include <time.h>
 #include <termios.h>
 #include <sys/ioctl.h>
+#include <sys/file.h>
 
 #include "utils.h"
 
@@ -547,11 +548,34 @@ static int setup_listener(const char *sock_path)
 	struct sockaddr_un addr;
 	socklen_t addrlen;
 	int rv, sd;
+	int lock_fd = -1;
+	char lock_path[PATH_MAX];
+
+	/* Create lock file path based on socket path */
+	snprintf(lock_path, sizeof(lock_path), "%s.lock", sock_path);
+
+	/* Try to acquire lock */
+	lock_fd = open(lock_path, O_CREAT | O_WRONLY, 0600);
+	if (lock_fd < 0) {
+		syslog(LOG_ERR, "open lock file %s: error %d: %s", lock_path, errno, strerror(errno));
+		return -1;
+	}
+
+	if (flock(lock_fd, LOCK_EX | LOCK_NB) < 0) {
+		if (errno == EWOULDBLOCK) {
+			syslog(LOG_ERR, "Another instance is already running (lock file %s)", lock_path);
+		} else {
+			syslog(LOG_ERR, "flock %s: error %d: %s", lock_path, errno, strerror(errno));
+		}
+		close(lock_fd);
+		return -1;
+	}
 
 	/* we listen for new client connections on socket sd */
 	sd = socket(AF_LOCAL, SOCK_STREAM, 0);
 	if (sd < 0) {
 		syslog(LOG_ERR, "socket: error %d: %s", sd, strerror(errno));
+		close(lock_fd);
 		return sd;
 	}
 
@@ -565,6 +589,7 @@ static int setup_listener(const char *sock_path)
 	if (rv < 0) {
 		syslog(LOG_ERR, "bind: error %d: %s", rv, strerror(errno));
 		close(sd);
+		close(lock_fd);
 		return rv;
 	}
 
@@ -572,6 +597,7 @@ static int setup_listener(const char *sock_path)
 	if (rv < 0) {
 		syslog(LOG_ERR, "listen: error %d: %s", rv, strerror(errno));
 		close(sd);
+		close(lock_fd);
 		return rv;
 	}
 
@@ -580,6 +606,7 @@ static int setup_listener(const char *sock_path)
 	if (rv < 0) {
 		syslog(LOG_ERR, "chmod: error %d: %s", rv, strerror(errno));
 		close(sd);
+		close(lock_fd);
 		return rv;
 	}
 
@@ -595,6 +622,7 @@ static int setup_listener(const char *sock_path)
 	if (!grp) {
 		syslog(LOG_ERR, "chown: no suitable group found (tried sudo, wheel)");
 		close(sd);
+		close(lock_fd);
 		return -1;
 	}
 
@@ -603,9 +631,11 @@ static int setup_listener(const char *sock_path)
 	if (rv < 0) {
 		syslog(LOG_ERR, "chown: error %d: %s", rv, strerror(errno));
 		close(sd);
+		close(lock_fd);
 		return rv;
 	}
 
+	/* Keep lock_fd open to maintain lock */
 	return sd;
 }
 
