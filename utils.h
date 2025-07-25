@@ -36,6 +36,7 @@ struct csdo_request_header {
 	int type; /* 消息类型：CSDO_MSG_COMMAND 或 CSDO_MSG_WINSIZE */
 	int std_fileno; /* 输入数据对应的文件描述符（仅用于命令数据） */
 	struct winsize ws; /* 终端窗口大小 */
+	struct termios term; /* 终端属性 */
 };
 
 struct csdo_respond_header {

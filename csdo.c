@@ -166,6 +166,10 @@ int csdo_query_request(void *cmd, size_t len, uid_t uid, int no_pty)
 			} else {
 				x_printf(LOG_DEBUG, "csdo_query_request: window size rows=%d, cols=%d", ws.ws_row, ws.ws_col);
 			}
+			/* 获取客户端终端设置 */
+			if (tcgetattr(STDIN_FILENO, &rqh.term) == -1) {
+				x_printf(LOG_ERR, "csdo_query_request: tcgetattr: %s", strerror(errno));
+			}
 		}
 	}
 
@@ -436,7 +440,7 @@ int main(int argc, char **argv)
 	list.argc = 0;
 	list.cwd = NULL;
 	uid_t target_uid = 0; /* Default to root */
-	int no_pty = 0;
+	int no_pty = !isatty(STDIN_FILENO);
 	int optind = 1;
 
 	while (optind < argc) {
@@ -509,9 +513,6 @@ int main(int argc, char **argv)
 	}
 	x_printf(LOG_DEBUG, "main: encoded command '%s', size=%u", argv[optind], size);
 
-	if (!isatty(STDIN_FILENO) && !isatty(STDOUT_FILENO) && !isatty(STDERR_FILENO)) {
-		no_pty = 1;
-	}
 	int res = csdo_query_request(data, size, target_uid, no_pty);
 	free(data);
 	return res;

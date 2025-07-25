@@ -51,6 +51,8 @@ typedef struct relay_session {
 	int pipe_stderr[2];   // 标准错误管道
 	int epoll_fd;         // epoll 文件描述符
 	int no_pty;
+	struct winsize ws;
+	struct termios term;
 } relay_session_t;
 
 // 初始化资源结构体
@@ -62,6 +64,7 @@ void init_relay_session(relay_session_t *rs) {
 	rs->pipe_stdout[0] = rs->pipe_stdout[1] = -1;
 	rs->pipe_stderr[0] = rs->pipe_stderr[1] = -1;
 	rs->epoll_fd = -1;
+	memset(&rs->ws, 0, sizeof(rs->ws));
 }
 
 // 清理资源，关闭所有打开的文件描述符
@@ -104,8 +107,8 @@ void cleanup_relay_session(relay_session_t *rs) {
 	}
 }
 
-// 创建标准输入、输出和错误管道
-int create_pipes(relay_session_t *rs) {
+int create_norm_bridge(relay_session_t *rs)
+{
 #ifdef USE_PIPES
 	if (pipe(rs->pipe_stdin) == -1) {
 		x_printf(LOG_ERR, "Failed to create stdin pipe: %s", strerror(errno));
@@ -149,6 +152,30 @@ int create_pipes(relay_session_t *rs) {
 	fcntl(rs->pipe_stderr[1], F_SETFD, FD_CLOEXEC); // 设置 stderr 写端在 exec 时关闭，保证epoll_wait能收到事件处理EOF
 	x_printf(LOG_INFO, "Created stderr pipe: read=%d, write=%d", rs->pipe_stderr[0], rs->pipe_stderr[1]);
 #endif
+	return 0;
+}
+
+int create_pty_bridge(relay_session_t *rs)
+{
+	char slave_name[128];
+
+	/* 使用客户端提供的窗口大小 */
+	struct winsize default_ws = { .ws_row = 24, .ws_col = 80 };
+	if (rs->ws.ws_row == 0 || rs->ws.ws_col == 0) {
+		rs->ws = default_ws;
+		x_printf(LOG_WARNING, "do_local_cmd: no window size provided, using default rows=%d, cols=%d", rs->ws.ws_row, rs->ws.ws_col);
+	} else {
+		x_printf(LOG_DEBUG, "do_local_cmd: window size rows=%d, cols=%d", rs->ws.ws_row, rs->ws.ws_col);
+	}
+
+	/* 创建 PTY 并应用终端设置 */
+	if (openpty(&rs->master_fd, &rs->slave_fd, slave_name, &rs->term, &rs->ws) == -1) {
+		x_printf(LOG_ERR, "Failed to create PTY: %s", strerror(errno));
+		return -1;
+	}
+	fcntl(rs->master_fd, F_SETFD, FD_CLOEXEC); // 设置 master 在 exec 时关闭，保证epoll_wait能收到事件处理EOF
+	fcntl(rs->slave_fd, F_SETFD, FD_CLOEXEC); // 设置 slave 在 exec 时关闭，保证epoll_wait能收到事件处理EOF
+	x_printf(LOG_INFO, "Created PTY %s: master_fd=%d, slave_fd=%d", slave_name, rs->master_fd, rs->slave_fd);
 	return 0;
 }
 
@@ -203,13 +230,14 @@ void child_process(relay_session_t *rs)
 	if (!rs->no_pty) {
 		close(rs->master_fd);
 		x_printf(LOG_INFO, "Child: Closed master_fd=%d", rs->master_fd);
+	} else {
+		close(rs->pipe_stdin[1]);
+		x_printf(LOG_INFO, "Child: Closed pipe_stdin[1]=%d", rs->pipe_stdin[1]);
+		close(rs->pipe_stdout[0]);
+		x_printf(LOG_INFO, "Child: Closed pipe_stdout[0]=%d", rs->pipe_stdout[0]);
+		close(rs->pipe_stderr[0]);
+		x_printf(LOG_INFO, "Child: Closed pipe_stderr[0]=%d", rs->pipe_stderr[0]);
 	}
-	close(rs->pipe_stdin[1]);
-	x_printf(LOG_INFO, "Child: Closed pipe_stdin[1]=%d", rs->pipe_stdin[1]);
-	close(rs->pipe_stdout[0]);
-	x_printf(LOG_INFO, "Child: Closed pipe_stdout[0]=%d", rs->pipe_stdout[0]);
-	close(rs->pipe_stderr[0]);
-	x_printf(LOG_INFO, "Child: Closed pipe_stderr[0]=%d", rs->pipe_stderr[0]);
 
 	if (!rs->no_pty) {
 		// 设置 slave_fd 为控制终端
@@ -218,35 +246,32 @@ void child_process(relay_session_t *rs)
 			exit(EXIT_FAILURE);
 		}
 		x_printf(LOG_INFO, "Child: login_tty succeeded on slave_fd=%d", rs->slave_fd);
-	}
-
-	// 重定向标准输入
-	if (dup2(rs->pipe_stdin[0], STDIN_FILENO) == -1) {
-		x_printf(LOG_ERR, "Child: dup2 stdin failed: %s", strerror(errno));
-		exit(EXIT_FAILURE);
-	}
-	close(rs->pipe_stdin[0]);
-	x_printf(LOG_INFO, "Child: Closed pipe_stdin[0]=%d", rs->pipe_stdin[0]);
-
-	// 重定向标准输出
-	if (dup2(rs->pipe_stdout[1], STDOUT_FILENO) == -1) {
-		x_printf(LOG_ERR, "Child: dup2 stdout failed: %s", strerror(errno));
-		exit(EXIT_FAILURE);
-	}
-	close(rs->pipe_stdout[1]);
-	x_printf(LOG_INFO, "Child: Closed pipe_stdout[1]=%d", rs->pipe_stdout[1]);
-
-	// 重定向标准错误
-	if (dup2(rs->pipe_stderr[1], STDERR_FILENO) == -1) {
-		x_printf(LOG_ERR, "Child: dup2 stderr failed: %s", strerror(errno));
-		exit(EXIT_FAILURE);
-	}
-	close(rs->pipe_stderr[1]);
-	x_printf(LOG_INFO, "Child: Closed pipe_stderr[1]=%d", rs->pipe_stderr[1]);
-
-	if (!rs->no_pty) {
 		close(rs->slave_fd);
 		x_printf(LOG_INFO, "Child: Closed slave_fd=%d", rs->slave_fd);
+	} else {
+		// 重定向标准输入
+		if (dup2(rs->pipe_stdin[0], STDIN_FILENO) == -1) {
+			x_printf(LOG_ERR, "Child: dup2 stdin failed: %s", strerror(errno));
+			exit(EXIT_FAILURE);
+		}
+		close(rs->pipe_stdin[0]);
+		x_printf(LOG_INFO, "Child: Closed pipe_stdin[0]=%d", rs->pipe_stdin[0]);
+
+		// 重定向标准输出
+		if (dup2(rs->pipe_stdout[1], STDOUT_FILENO) == -1) {
+			x_printf(LOG_ERR, "Child: dup2 stdout failed: %s", strerror(errno));
+			exit(EXIT_FAILURE);
+		}
+		close(rs->pipe_stdout[1]);
+		x_printf(LOG_INFO, "Child: Closed pipe_stdout[1]=%d", rs->pipe_stdout[1]);
+
+		// 重定向标准错误
+		if (dup2(rs->pipe_stderr[1], STDERR_FILENO) == -1) {
+			x_printf(LOG_ERR, "Child: dup2 stderr failed: %s", strerror(errno));
+			exit(EXIT_FAILURE);
+		}
+		close(rs->pipe_stderr[1]);
+		x_printf(LOG_INFO, "Child: Closed pipe_stderr[1]=%d", rs->pipe_stderr[1]);
 	}
 }
 
@@ -270,6 +295,7 @@ int do_client_event(relay_session_t *rs)
 			if (ioctl(rs->master_fd, TIOCSWINSZ, &rqh.ws) == -1) {
 				x_printf(LOG_ERR, "do_local_cmd: ioctl TIOCSWINSZ failed: %s", strerror(errno));
 			} else {
+				rs->ws = rqh.ws; // 更新 relay_session_t 中的窗口大小
 				x_printf(LOG_DEBUG, "do_local_cmd: updated window size rows=%d, cols=%d", rqh.ws.ws_row, rqh.ws.ws_col);
 			}
 		}
@@ -285,10 +311,17 @@ int do_client_event(relay_session_t *rs)
 	}
 	if (rqh.length == 0) {
 		x_printf(LOG_INFO, "do_local_cmd: client tell input over");
-		// 关闭标准输入管道写端以触发 EOF
-		close(rs->pipe_stdin[1]);
-		x_printf(LOG_INFO, "Parent: Closed pipe_stdin[1]=%d to trigger EOF", rs->pipe_stdin[1]);
-		rs->pipe_stdin[1] = -1;
+		if (!rs->no_pty) {
+			// 关闭控制终端以触发 EOF
+			close(rs->master_fd);
+			x_printf(LOG_INFO, "Parent: Closed master_fd=%d to trigger EOF", rs->master_fd);
+			rs->master_fd = -1;
+		} else {
+			// 关闭标准输入管道写端以触发 EOF
+			close(rs->pipe_stdin[1]);
+			x_printf(LOG_INFO, "Parent: Closed pipe_stdin[1]=%d to trigger EOF", rs->pipe_stdin[1]);
+			rs->pipe_stdin[1] = -1;
+		}
 		return exit_steps_success;
 	}
 	uint64_t len = rqh.length;
@@ -299,9 +332,13 @@ int do_client_event(relay_session_t *rs)
 			x_printf(LOG_INFO, "do_local_cmd: read client data failed: %s", strerror(errno));
 			return exit_steps_client_error;
 		}
-		rv = do_write(rs->pipe_stdin[1], data, todo);
+		if (!rs->no_pty) {
+			rv = do_write(rs->master_fd, data, todo);
+		} else {
+			rv = do_write(rs->pipe_stdin[1], data, todo);
+		}
 		if (rv < 0) {
-			x_printf(LOG_ERR, "do_local_cmd: write stdin: %s", strerror(errno));
+			x_printf(LOG_ERR, "do_local_cmd: write child: %s", strerror(errno));
 			return exit_steps_child_error;
 		}
 		len -= todo;
@@ -312,14 +349,14 @@ int do_client_event(relay_session_t *rs)
 // 处理 epoll 事件
 int handle_epoll_events(int epfd, relay_session_t *rs, CSDO_GOT_CB got_cb, void *private)
 {
-	int max = 4;
+	int max = 3;
 	struct epoll_event events[max];
-	bool stdout_done = false, stderr_done = false, child_exited = (rs->no_pty) ? true : false;
+	bool stdout_done = false, stderr_done = false;
 
-	while (!(stdout_done && stderr_done && child_exited)) {
-		x_printf(LOG_DEBUG, "epoll_wait stdout_done=%d, stderr_done=%d, child_exited=%d", stdout_done, stderr_done, child_exited);
+	while (!(stdout_done && stderr_done)) {
+		x_printf(LOG_DEBUG, "epoll_wait stdout_done=%d, stderr_done=%d", stdout_done, stderr_done);
 		int num = epoll_wait(epfd, events, max, -1);
-		x_printf(LOG_INFO, "epoll_wait returned %d, child_exited=%d", num, child_exited);
+		x_printf(LOG_INFO, "epoll_wait returned %d", num);
 
 		if (num == -1) {
 			x_printf(LOG_ERR, "epoll_wait failed: %s", strerror(errno));
@@ -345,6 +382,8 @@ int handle_epoll_events(int epfd, relay_session_t *rs, CSDO_GOT_CB got_cb, void 
 						if (bytes > 0) {
 							if (fd == rs->pipe_stdout[0] || fd == rs->pipe_stderr[0])
 								got_cb(private, data, bytes, (fd == rs->pipe_stdout[0]) ? STDOUT_FILENO : STDERR_FILENO);
+							else
+								got_cb(private, data, bytes, STDOUT_FILENO);
 							x_printf(LOG_DEBUG, "Received from %s: %s", source, data);
 						} else if (bytes == 0) {
 							/* 写端已关闭，管道无数据 */
@@ -355,8 +394,10 @@ int handle_epoll_events(int epfd, relay_session_t *rs, CSDO_GOT_CB got_cb, void 
 								stdout_done = true;
 							else if (fd == rs->pipe_stderr[0])
 								stderr_done = true;
-							else
-								child_exited = true;
+							else {
+								stdout_done = true;
+								stderr_done = true;
+							}
 							break;
 						} else if (bytes == -1 && errno == EINTR) {
 							continue;
@@ -372,8 +413,10 @@ int handle_epoll_events(int epfd, relay_session_t *rs, CSDO_GOT_CB got_cb, void 
 								stdout_done = true;
 							else if (fd == rs->pipe_stderr[0])
 								stderr_done = true;
-							else
-								child_exited = true;
+							else {
+								stdout_done = true;
+								stderr_done = true;
+							}
 							break;
 						}
 					}
@@ -394,9 +437,10 @@ int handle_epoll_events(int epfd, relay_session_t *rs, CSDO_GOT_CB got_cb, void 
 					stdout_done = true;
 				else if (fd == rs->pipe_stderr[0])
 					stderr_done = true;
-				else if (fd == rs->master_fd)
-					child_exited = true;
-				else
+				else if (fd == rs->master_fd) {
+					stdout_done = true;
+					stderr_done = true;
+				} else
 					return exit_steps_client_error;
 				continue;
 			}
@@ -415,9 +459,10 @@ int handle_epoll_events(int epfd, relay_session_t *rs, CSDO_GOT_CB got_cb, void 
  * client_fd: Client socket for communication.
  * cwd: Working directory to set for the command.
  * ws: Window size to set for PTY.
+ * term: Terminal settings to apply to PTY.
  * Returns the command's exit status or -1 on error.
  */
-int do_local_cmd(char **arglist, CSDO_GOT_CB got_cb, void *private, uid_t uid, int no_pty, int client_fd, const char *cwd, struct winsize *ws)
+int do_local_cmd(char **arglist, CSDO_GOT_CB got_cb, void *private, uid_t uid, int no_pty, int client_fd, const char *cwd, struct winsize ws, struct termios term)
 {
 	int status;
 	relay_session_t rs;
@@ -431,42 +476,19 @@ int do_local_cmd(char **arglist, CSDO_GOT_CB got_cb, void *private, uid_t uid, i
 	init_relay_session(&rs);
 	rs.client_fd = client_fd;
 	rs.no_pty = no_pty;
-
-	// 创建管道
-	if (create_pipes(&rs) == -1) {
-		cleanup_relay_session(&rs);
-		return -1;
-	}
+	rs.ws = ws;
+	rs.term = term;
 
 	if (!no_pty) {
-		char slave_name[128];
-		struct termios term;
-
-		/* 设置默认终端设置 */
-		memset(&term, 0, sizeof(term));
-		cfmakeraw(&term);
-		term.c_cc[VMIN] = 1;
-		term.c_cc[VTIME] = 0;
-		x_printf(LOG_DEBUG, "do_local_cmd: using raw mode for PTY");
-
-		/* 使用客户端提供的窗口大小 */
-		struct winsize default_ws = { .ws_row = 24, .ws_col = 80 };
-		if (!ws) {
-			ws = &default_ws;
-			x_printf(LOG_WARNING, "do_local_cmd: no window size provided, using default rows=%d, cols=%d", ws->ws_row, ws->ws_col);
-		} else {
-			x_printf(LOG_DEBUG, "do_local_cmd: window size rows=%d, cols=%d", ws->ws_row, ws->ws_col);
-		}
-
-		/* 创建 PTY 并应用终端设置 */
-		if (openpty(&rs.master_fd, &rs.slave_fd, slave_name, &term, ws) == -1) {
-			x_printf(LOG_ERR, "Failed to create PTY: %s", strerror(errno));
+		if (create_pty_bridge(&rs) == -1) {
 			cleanup_relay_session(&rs);
 			return -1;
 		}
-		fcntl(rs.master_fd, F_SETFD, FD_CLOEXEC); // 设置 master 在 exec 时关闭，保证epoll_wait能收到事件处理EOF
-		fcntl(rs.slave_fd, F_SETFD, FD_CLOEXEC); // 设置 slave 在 exec 时关闭，保证epoll_wait能收到事件处理EOF
-		x_printf(LOG_INFO, "Created PTY %s: master_fd=%d, slave_fd=%d", slave_name, rs.master_fd, rs.slave_fd);
+	} else {
+		if (create_norm_bridge(&rs) == -1) {
+			cleanup_relay_session(&rs);
+			return -1;
+		}
 	}
 
 	// 创建子进程
@@ -514,14 +536,12 @@ int do_local_cmd(char **arglist, CSDO_GOT_CB got_cb, void *private, uid_t uid, i
 			}
 
 			/* 设置 COLUMNS 和 LINES */
-			if (ws) {
-				char cols[16], rows[16];
-				snprintf(cols, sizeof(cols), "%d", ws->ws_col);
-				snprintf(rows, sizeof(rows), "%d", ws->ws_row);
-				setenv("COLUMNS", cols, 1);
-				setenv("LINES", rows, 1);
-				x_printf(LOG_DEBUG, "do_local_cmd: set COLUMNS=%s, LINES=%s", cols, rows);
-			}
+			char cols[16], rows[16];
+			snprintf(cols, sizeof(cols), "%d", rs.ws.ws_col);
+			snprintf(rows, sizeof(rows), "%d", rs.ws.ws_row);
+			setenv("COLUMNS", cols, 1);
+			setenv("LINES", rows, 1);
+			x_printf(LOG_DEBUG, "do_local_cmd: set COLUMNS=%s, LINES=%s", cols, rows);
 
 			/*
 			 * The underlying ssh is in the same process group, so we must
@@ -539,10 +559,6 @@ int do_local_cmd(char **arglist, CSDO_GOT_CB got_cb, void *private, uid_t uid, i
 			close(STDIN_FILENO);
 			close(STDOUT_FILENO);
 			close(STDERR_FILENO);
-			if (!rs.no_pty) {
-				close(rs.slave_fd);
-				x_printf(LOG_INFO, "Child: Closed slave_fd=%d", rs.slave_fd);
-			}
 			_exit(exit_code);
 		default:
 			/* Parent. Close the other side, and return the local side. */
@@ -550,26 +566,31 @@ int do_local_cmd(char **arglist, CSDO_GOT_CB got_cb, void *private, uid_t uid, i
 				close(rs.slave_fd);
 				x_printf(LOG_INFO, "Parent: Closed slave_fd=%d", rs.slave_fd);
 				rs.slave_fd = -1;
+			} else {
+				close(rs.pipe_stdin[0]);
+				x_printf(LOG_INFO, "Parent: Closed pipe_stdin[0]=%d", rs.pipe_stdin[0]);
+				rs.pipe_stdin[0] = -1;
+				close(rs.pipe_stdout[1]);
+				x_printf(LOG_INFO, "Parent: Closed pipe_stdout[1]=%d", rs.pipe_stdout[1]);
+				rs.pipe_stdout[1] = -1;
+				close(rs.pipe_stderr[1]);
+				x_printf(LOG_INFO, "Parent: Closed pipe_stderr[1]=%d", rs.pipe_stderr[1]);
+				rs.pipe_stderr[1] = -1;
 			}
-			close(rs.pipe_stdin[0]);
-			x_printf(LOG_INFO, "Parent: Closed pipe_stdin[0]=%d", rs.pipe_stdin[0]);
-			rs.pipe_stdin[0] = -1;
-			close(rs.pipe_stdout[1]);
-			x_printf(LOG_INFO, "Parent: Closed pipe_stdout[1]=%d", rs.pipe_stdout[1]);
-			rs.pipe_stdout[1] = -1;
-			close(rs.pipe_stderr[1]);
-			x_printf(LOG_INFO, "Parent: Closed pipe_stderr[1]=%d", rs.pipe_stderr[1]);
-			rs.pipe_stderr[1] = -1;
 
 			// 设置文件描述符为非阻塞
-			if (set_nonblocking(rs.pipe_stdout[0], "pipe_stdout[0]") == -1 ||
-					set_nonblocking(rs.pipe_stderr[0], "pipe_stderr[0]") == -1 ||
-					set_nonblocking(rs.client_fd, "client_fd") == -1) {
+			if (set_nonblocking(rs.client_fd, "client_fd") == -1) {
 				cleanup_relay_session(&rs);
 				return -1;
 			}
 			if (!rs.no_pty) {
 				if (set_nonblocking(rs.master_fd, "master_fd") == -1) {
+					cleanup_relay_session(&rs);
+					return -1;
+				}
+			} else {
+				if (set_nonblocking(rs.pipe_stdout[0], "pipe_stdout[0]") == -1 ||
+						set_nonblocking(rs.pipe_stderr[0], "pipe_stderr[0]") == -1) {
 					cleanup_relay_session(&rs);
 					return -1;
 				}
@@ -585,14 +606,18 @@ int do_local_cmd(char **arglist, CSDO_GOT_CB got_cb, void *private, uid_t uid, i
 			x_printf(LOG_INFO, "Parent: Created epoll instance, epoll_fd=%d", rs.epoll_fd);
 
 			// 注册文件描述符到 epoll
-			if (register_epoll(rs.epoll_fd, rs.pipe_stdout[0], "pipe_stdout[0]") == -1 ||
-					register_epoll(rs.epoll_fd, rs.pipe_stderr[0], "pipe_stderr[0]") == -1 ||
-					register_epoll(rs.epoll_fd, rs.client_fd, "client_fd") == -1) {
+			if (register_epoll(rs.epoll_fd, rs.client_fd, "client_fd") == -1) {
 				cleanup_relay_session(&rs);
 				return -1;
 			}
 			if (!rs.no_pty) {
 				if (register_epoll(rs.epoll_fd, rs.master_fd, "master_fd") == -1) {
+					cleanup_relay_session(&rs);
+					return -1;
+				}
+			} else {
+				if (register_epoll(rs.epoll_fd, rs.pipe_stdout[0], "pipe_stdout[0]") == -1 ||
+						register_epoll(rs.epoll_fd, rs.pipe_stderr[0], "pipe_stderr[0]") == -1) {
 					cleanup_relay_session(&rs);
 					return -1;
 				}
@@ -817,8 +842,9 @@ static void csdo_got_cb(void *private, void *data, uint64_t size, int std_fileno
  * uid: User ID to run the command as.
  * no_pty: If non-zero, run without a PTY.
  * ws: Window size to set for PTY.
+ * term: Terminal settings to apply to PTY.
  */
-static void do_query_work(int fd, char *cmd, uint64_t len, uid_t uid, int no_pty, struct winsize *ws)
+static void do_query_work(int fd, char *cmd, uint64_t len, uid_t uid, int no_pty, struct winsize ws, struct termios term)
 {
 	struct cmd_arg_list list = {};
 
@@ -839,7 +865,7 @@ static void do_query_work(int fd, char *cmd, uint64_t len, uid_t uid, int no_pty
 		x_printf(LOG_DEBUG, "do_query_work: cwd='%s'", list.cwd);
 	}
 
-	int result = do_local_cmd(list.argv, csdo_got_cb, (void *)&fd, uid, no_pty, fd, list.cwd, ws);
+	int result = do_local_cmd(list.argv, csdo_got_cb, (void *)&fd, uid, no_pty, fd, list.cwd, ws, term);
 
 	struct csdo_respond_header rph = {};
 	csdo_query_init_header(&rph.bh);
@@ -905,7 +931,7 @@ static void *csdo_query_handle(void *arg)
 		}
 	}
 
-	do_query_work(fd, extra, rqh.length, rqh.uid, rqh.no_pty, &rqh.ws);
+	do_query_work(fd, extra, rqh.length, rqh.uid, rqh.no_pty, rqh.ws, rqh.term);
 
 out:
 	if (extra) {
