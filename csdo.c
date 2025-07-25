@@ -26,13 +26,13 @@
 
 #include "utils.h"
 
-/* Global variables for signal handling */
+/* Global variables for signal handling and terminal state */
 static struct termios g_orig_termios;
 static int g_sktfd = -1;
 static int g_inpty = 0;
 
 /*
- * SIGWINCH handler for window size changes.
+ * Handles SIGWINCH signal for terminal window size changes.
  */
 static volatile sig_atomic_t g_winch_received = 0;
 static void handle_sigwinch(int sig)
@@ -41,7 +41,8 @@ static void handle_sigwinch(int sig)
 }
 
 /*
- * Connects to the Unix domain socket at sock_path.
+ * Establishes a connection to the Unix domain socket at the specified path.
+ * sock_path: Path to the Unix domain socket.
  * Returns the socket descriptor or -1 on error.
  */
 static int do_connect(const char *sock_path)
@@ -52,7 +53,7 @@ static int do_connect(const char *sock_path)
 
 	fd = socket(PF_UNIX, SOCK_STREAM, 0);
 	if (fd < 0) {
-		x_printf(LOG_ERR, "do_connect: socket: %s", strerror(errno));
+		x_printf(LOG_ERR, "Failed to create socket: %s", strerror(errno));
 		return fd;
 	}
 
@@ -64,15 +65,18 @@ static int do_connect(const char *sock_path)
 	rv = connect(fd, (struct sockaddr *)&sun, addrlen);
 	if (rv < 0) {
 		if (errno != EPERM)
-			x_printf(LOG_ERR, "do_connect: connect: %s", strerror(errno));
+			x_printf(LOG_ERR, "Failed to connect to socket %s: %s", sock_path, strerror(errno));
 		close(fd);
 		return rv;
 	}
+	x_printf(LOG_DEBUG, "Successfully connected to socket: %s", sock_path);
 	return fd;
 }
 
 /*
- * Sets the terminal to raw mode and returns the original termios settings.
+ * Configures the terminal to raw mode and saves the original termios settings.
+ * fd: File descriptor of the terminal.
+ * orig_termios: Pointer to store original terminal settings.
  * Returns 0 on success, -1 on error.
  */
 static int setup_termios(int fd, struct termios *orig_termios)
@@ -80,29 +84,30 @@ static int setup_termios(int fd, struct termios *orig_termios)
 	struct termios term;
 
 	if (!isatty(fd)) {
-		x_printf(LOG_DEBUG, "setup_termios: fd is not a terminal");
+		x_printf(LOG_DEBUG, "File descriptor %d is not a terminal", fd);
 		return 0;
 	}
 	if (tcgetattr(fd, orig_termios) == -1) {
-		x_printf(LOG_ERR, "setup_termios: tcgetattr: %s", strerror(errno));
+		x_printf(LOG_ERR, "Failed to get terminal attributes: %s", strerror(errno));
 		return -1;
 	}
 
 	term = *orig_termios;
-	// 自定义“半原始”模式：避免输出错位
-	term.c_lflag &= ~(ECHO | ICANON | IEXTEN); // Keep ISIG enabled to allow Ctrl+C
+	/* Configure semi-raw mode to prevent output misalignment */
+	term.c_lflag &= ~(ECHO | ICANON | IEXTEN); /* Keep ISIG enabled for Ctrl+C */
 	term.c_iflag &= ~(IXON | ICRNL | BRKINT | INPCK | ISTRIP);
-	term.c_oflag |= OPOST;                             // 保留输出处理（如 \n 自动转 \r\n）
-	term.c_iflag |= ICRNL;                             // 保留输入处理（如 \n 自动转 \r\n）
+	term.c_oflag |= OPOST; /* Retain output processing (e.g., \n to \r\n) */
+	term.c_iflag |= ICRNL; /* Retain input processing (e.g., \n to \r\n) */
 	term.c_cflag |= CS8;
 
-	term.c_cc[VMIN] = 1; // 最小读取字节数
-	term.c_cc[VTIME] = 0; // 无超时
+	term.c_cc[VMIN] = 1; /* Minimum bytes to read */
+	term.c_cc[VTIME] = 0; /* No timeout */
 
 	if (tcsetattr(fd, TCSANOW, &term) == -1) {
-		x_printf(LOG_ERR, "setup_termios: tcsetattr: %s", strerror(errno));
+		x_printf(LOG_ERR, "Failed to set terminal attributes: %s", strerror(errno));
 		return -1;
 	}
+	x_printf(LOG_DEBUG, "Terminal set to raw mode for fd=%d", fd);
 	return 0;
 }
 
@@ -115,26 +120,29 @@ static int setup_termios(int fd, struct termios *orig_termios)
 static int restore_termios(int fd, struct termios *orig_termios)
 {
 	if (!isatty(fd)) {
-		x_printf(LOG_DEBUG, "restore_termios: fd is not a terminal");
+		x_printf(LOG_DEBUG, "File descriptor %d is not a terminal", fd);
 		return 0;
 	}
 	if (tcsetattr(fd, TCSANOW, orig_termios) == -1) {
-		x_printf(LOG_ERR, "restore_termios: tcsetattr: %s", strerror(errno));
+		x_printf(LOG_ERR, "Failed to restore terminal attributes: %s", strerror(errno));
 		return -1;
 	}
+	x_printf(LOG_DEBUG, "Restored original terminal settings for fd=%d", fd);
 	return 0;
 }
 
 /*
- * Signal handler for SIGINT (Ctrl+C)
+ * Handles SIGINT signal (Ctrl+C) to clean up and exit.
  */
 static void handle_sigint(int sig)
 {
 	if (g_inpty) {
 		restore_termios(STDIN_FILENO, &g_orig_termios);
+		x_printf(LOG_DEBUG, "SIGINT received, restored terminal settings");
 	}
 	if (g_sktfd != -1) {
 		close(g_sktfd);
+		x_printf(LOG_DEBUG, "SIGINT received, closed socket: fd=%d", g_sktfd);
 	}
 	exit(EXIT_FAILURE);
 }
@@ -160,15 +168,15 @@ int csdo_query_request(void *cmd, size_t len, uid_t uid, int no_pty)
 	ws.ws_col = 80;
 	if (!no_pty) {
 		if (isatty(STDIN_FILENO)) {
-			/* 获取客户端终端窗口大小 */
+			/* Retrieve client terminal window size */
 			if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == -1) {
-				x_printf(LOG_ERR, "csdo_query_request: ioctl TIOCGWINSZ: %s", strerror(errno));
+				x_printf(LOG_ERR, "Failed to get window size: %s", strerror(errno));
 			} else {
-				x_printf(LOG_DEBUG, "csdo_query_request: window size rows=%d, cols=%d", ws.ws_row, ws.ws_col);
+				x_printf(LOG_DEBUG, "Retrieved window size: rows=%d, cols=%d", ws.ws_row, ws.ws_col);
 			}
-			/* 获取客户端终端设置 */
+			/* Retrieve client terminal settings */
 			if (tcgetattr(STDIN_FILENO, &rqh.term) == -1) {
-				x_printf(LOG_ERR, "csdo_query_request: tcgetattr: %s", strerror(errno));
+				x_printf(LOG_ERR, "Failed to get terminal settings: %s", strerror(errno));
 			}
 		}
 	}
@@ -181,50 +189,59 @@ int csdo_query_request(void *cmd, size_t len, uid_t uid, int no_pty)
 		return rv;
 	}
 	if (set_nonblocking(fd, "socket fd") == -1) {
+		x_printf(LOG_ERR, "Failed to set socket to non-blocking mode: fd=%d", fd);
+		close(fd);
 		return -1;
 	}
-	g_sktfd = fd; // Store fd for signal handler
+	g_sktfd = fd; /* Store fd for signal handler */
 	if (!no_pty) {
-		// 设置原始模式以处理交互式输入
+		/* Set terminal to raw mode for interactive input */
 		if (setup_termios(STDIN_FILENO, &g_orig_termios) == -1) {
-			goto out_close;
+			close(fd);
+			return -1;
 		}
-		g_inpty = 1; // Set global flag for signal handler
+		g_inpty = 1; /* Set global flag for signal handler */
 	}
 
-	/* 注册 SIGWINCH 信号处理程序 */
+	/* Register SIGWINCH signal handler */
 	struct sigaction sa;
 	sa.sa_handler = handle_sigwinch;
 	sigemptyset(&sa.sa_mask);
 	sa.sa_flags = SA_RESTART;
 	if (sigaction(SIGWINCH, &sa, NULL) == -1) {
-		x_printf(LOG_ERR, "csdo_query_request: sigaction SIGWINCH: %s", strerror(errno));
+		x_printf(LOG_ERR, "Failed to set SIGWINCH handler: %s", strerror(errno));
 	}
 
-	/* 发送命令请求 */
+	/* Send command request */
 	csdo_query_init_header(&rqh.bh);
 	rqh.length = len;
 	rqh.uid = uid;
 	rqh.no_pty = no_pty;
 	rqh.type = CSDO_MSG_COMMAND;
 	rqh.std_fileno = STDIN_FILENO;
-	rqh.ws = ws; /* 将窗口大小添加到请求头 */
+	rqh.ws = ws; /* Include window size in request header */
 
 	rv = do_write(fd, &rqh, sizeof(rqh));
-	if (rv < 0)
+	if (rv < 0) {
+		x_printf(LOG_ERR, "Failed to write request header: %s", strerror(errno));
 		goto out_restore;
+	}
+	x_printf(LOG_DEBUG, "Sent command request header: length=%zu, uid=%u, no_pty=%d", len, uid, no_pty);
 
 	if (len) {
 		rv = do_write(fd, cmd, len);
-		if (rv < 0)
+		if (rv < 0) {
+			x_printf(LOG_ERR, "Failed to write command data: %s", strerror(errno));
 			goto out_restore;
+		}
+		x_printf(LOG_DEBUG, "Sent command data: size=%zu", len);
 	}
 
 	bool input_finish = false;
 	bool sktfd_finish = false;
 	while (!sktfd_finish) {
 		if (!no_pty) {
-			/* 检查窗口大小变化并发送更新 */
+			/* Check for window size changes and send updates */
 			if (g_winch_received) {
 				if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) != -1) {
 					csdo_query_init_header(&rqh.bh);
@@ -237,50 +254,50 @@ int csdo_query_request(void *cmd, size_t len, uid_t uid, int no_pty)
 
 					rv = do_write(fd, &rqh, sizeof(rqh));
 					if (rv < 0) {
-						x_printf(LOG_ERR, "csdo_query_request: write winsize: %s", strerror(errno));
+						x_printf(LOG_ERR, "Failed to send window size update: %s", strerror(errno));
 						goto out_restore;
 					}
-					x_printf(LOG_DEBUG, "csdo_query_request: sent window size rows=%d, cols=%d", ws.ws_row, ws.ws_col);
+					x_printf(LOG_DEBUG, "Sent window size update: rows=%d, cols=%d", ws.ws_row, ws.ws_col);
 				}
-				g_winch_received = 0; /* 重置信号标志 */
+				g_winch_received = 0; /* Reset signal flag */
 			}
 		}
 
-		/* handle stdin and server output */
+		/* Monitor stdin and server socket for events */
 		int idxs = 0;
 		if (!input_finish) {
 			pfds[idxs].fd = STDIN_FILENO;
 			pfds[idxs].events = POLLIN;
-			idxs ++;
-			x_printf(LOG_DEBUG, "watch input");
+			idxs++;
+			x_printf(LOG_DEBUG, "Monitoring stdin for input");
 		}
 		if (!sktfd_finish) {
 			pfds[idxs].fd = fd;
 			pfds[idxs].events = POLLIN;
-			idxs ++;
-			x_printf(LOG_DEBUG, "watch socket");
+			idxs++;
+			x_printf(LOG_DEBUG, "Monitoring socket for data");
 		}
 		rv = poll(pfds, idxs, -1);
 		if (rv < 0) {
 			if (errno == EINTR || errno == EAGAIN)
 				continue;
-			fprintf(stderr, "csdo_query_request: poll: %s\n", strerror(errno));
-			x_printf(LOG_ERR, "csdo_query_request: poll: %s", strerror(errno));
+			fprintf(stderr, "Poll error: %s\n", strerror(errno));
+			x_printf(LOG_ERR, "Poll failed: %s", strerror(errno));
 			rv = -errno;
 			goto out_restore;
 		}
-		x_printf(LOG_DEBUG, "watch done");
+		x_printf(LOG_DEBUG, "Poll completed: %d events", rv);
 		if (rv == 0) {
 			continue;
 		}
 
-		for (i = 0; i < idxs; i ++) {
+		for (i = 0; i < idxs; i++) {
 			if (pfds[i].fd == STDIN_FILENO) {
 				if (pfds[i].revents & (POLLIN | POLLHUP)) {
 					ssize_t bytes = read(STDIN_FILENO, data, sizeof(data));
 					if (bytes == 0) {
 						input_finish = true;
-						x_printf(LOG_DEBUG, "input:over");
+						x_printf(LOG_DEBUG, "Stdin input completed");
 
 						csdo_query_init_header(&rqh.bh);
 						rqh.length = 0;
@@ -291,18 +308,20 @@ int csdo_query_request(void *cmd, size_t len, uid_t uid, int no_pty)
 						rqh.ws = ws;
 
 						rv = do_write(fd, &rqh, sizeof(rqh));
-						if (rv < 0)
+						if (rv < 0) {
+							x_printf(LOG_ERR, "Failed to send input completion: %s", strerror(errno));
 							goto out_restore;
-						x_printf(LOG_DEBUG, "write socket:over");
+						}
+						x_printf(LOG_DEBUG, "Sent input completion signal");
 						continue;
 					} else if (bytes < 0) {
 						if (errno == EAGAIN)
 							continue;
 						rv = -errno;
-						x_printf(LOG_ERR, "csdo_query_request: read stdin: %s", strerror(errno));
+						x_printf(LOG_ERR, "Failed to read from stdin: %s", strerror(errno));
 						goto out_restore;
 					} else {
-						x_printf(LOG_DEBUG, "read from input:%s", data);
+						x_printf(LOG_DEBUG, "Read %zd bytes from stdin", bytes);
 						csdo_query_init_header(&rqh.bh);
 						rqh.length = bytes;
 						rqh.uid = uid;
@@ -312,32 +331,38 @@ int csdo_query_request(void *cmd, size_t len, uid_t uid, int no_pty)
 						rqh.ws = ws;
 
 						rv = do_write(fd, &rqh, sizeof(rqh));
-						if (rv < 0)
+						if (rv < 0) {
+							x_printf(LOG_ERR, "Failed to write request header: %s", strerror(errno));
 							goto out_restore;
+						}
 						rv = do_write(fd, data, bytes);
-						if (rv < 0)
+						if (rv < 0) {
+							x_printf(LOG_ERR, "Failed to write stdin data: %s", strerror(errno));
 							goto out_restore;
-						x_printf(LOG_DEBUG, "write to socket:%s", data);
+						}
+						x_printf(LOG_DEBUG, "Wrote %zd bytes to socket", bytes);
 					}
 				}
 			} else {
 				if (pfds[i].revents & (POLLIN | POLLHUP | POLLRDHUP)) {
 					rv = do_read(fd, &rph, sizeof(rph));
-					if (rv < 0)
+					if (rv < 0) {
+						x_printf(LOG_ERR, "Failed to read response header: %s", strerror(errno));
 						goto out_restore;
+					}
 					if (rph.bh.magic != CSDO_QUERY_MAGIC) {
-						x_printf(LOG_ERR, "csdo_query_request: invalid response magic: %u", rph.bh.magic);
+						x_printf(LOG_ERR, "Invalid response magic number: %u", rph.bh.magic);
 						rv = -EINVAL;
 						goto out_restore;
 					}
 					if (rph.length == 0) {
 						rv = rph.result;
 						sktfd_finish = true;
-						x_printf(LOG_DEBUG, "socket:over");
+						x_printf(LOG_DEBUG, "Socket communication completed");
 						break;
 					}
 					if (rph.std_fileno != STDOUT_FILENO && rph.std_fileno != STDERR_FILENO) {
-						x_printf(LOG_ERR, "csdo_query_request: invalid std_fileno %d", rph.std_fileno);
+						x_printf(LOG_ERR, "Invalid std_fileno in response: %d", rph.std_fileno);
 						rv = -EINVAL;
 						goto out_restore;
 					}
@@ -345,17 +370,19 @@ int csdo_query_request(void *cmd, size_t len, uid_t uid, int no_pty)
 					while (len) {
 						int todo = MIN(len, sizeof(data));
 						rv = do_read(fd, data, todo);
-						if (rv < 0)
+						if (rv < 0) {
+							x_printf(LOG_ERR, "Failed to read response data: %s", strerror(errno));
 							goto out_restore;
-						x_printf(LOG_DEBUG, "read from socket:%s", data);
+						}
+						x_printf(LOG_DEBUG, "Read %d bytes from socket", todo);
 						if (rph.std_fileno == STDOUT_FILENO || rph.std_fileno == STDERR_FILENO) {
 							rv = do_write(rph.std_fileno, data, todo);
 							if (rv < 0) {
-								x_printf(LOG_ERR, "csdo_query_request: write output: %s", strerror(errno));
+								x_printf(LOG_ERR, "Failed to write to output: %s", strerror(errno));
 								goto out_restore;
 							}
-							x_printf(LOG_DEBUG, "write to output:%s", data);
-							/* 立即刷新输出以保持 ANSI 序列的时序 */
+							x_printf(LOG_DEBUG, "Wrote %d bytes to %s", todo, rph.std_fileno == STDOUT_FILENO ? "stdout" : "stderr");
+							/* Flush output immediately to preserve ANSI sequence timing */
 							fflush(rph.std_fileno == STDOUT_FILENO ? stdout : stderr);
 						}
 						len -= todo;
@@ -367,12 +394,12 @@ int csdo_query_request(void *cmd, size_t len, uid_t uid, int no_pty)
 
 out_restore:
 	if (!no_pty) {
-		/* 恢复终端设置 */
+		/* Restore terminal settings */
 		restore_termios(STDIN_FILENO, &g_orig_termios);
 		g_inpty = 0;
 	}
-out_close:
 	close(fd);
+	x_printf(LOG_DEBUG, "Closed socket: fd=%d", fd);
 	g_sktfd = -1; /* Reset global fd */
 	return rv;
 }
@@ -386,7 +413,7 @@ static int is_user_in_sudo_or_wheel_group(void)
 	uid_t uid = getuid();
 	struct passwd *pw = getpwuid(uid);
 	if (!pw) {
-		x_printf(LOG_ERR, "main: getpwuid failed for uid %u: %s", uid, strerror(errno));
+		x_printf(LOG_ERR, "Failed to get user info for uid %u: %s", uid, strerror(errno));
 		return -1;
 	}
 
@@ -394,21 +421,23 @@ static int is_user_in_sudo_or_wheel_group(void)
 	for (int i = 0; i < 2; i++) {
 		struct group *grp = getgrnam(groups[i]);
 		if (!grp) {
-			x_printf(LOG_DEBUG, "main: getgrnam failed for group '%s': %s", groups[i], strerror(errno));
+			x_printf(LOG_DEBUG, "Failed to get group info for '%s': %s", groups[i], strerror(errno));
 			continue;
 		}
 		for (char **member = grp->gr_mem; *member; member++) {
-			if (strcmp(*member, pw->pw_name) == 0)
+			if (strcmp(*member, pw->pw_name) == 0) {
+				x_printf(LOG_DEBUG, "User '%s' found in group '%s'", pw->pw_name, groups[i]);
 				return 0;
+			}
 		}
 	}
-	x_printf(LOG_ERR, "main: user '%s' not in sudo or wheel group", pw->pw_name);
+	x_printf(LOG_ERR, "User '%s' not in sudo or wheel group", pw->pw_name);
 	fprintf(stderr, "Permission denied: user not in sudo or wheel group\n");
 	return -EPERM;
 }
 
 /*
- * Main function to parse arguments and send a command request to the server.
+ * Main function to parse command-line arguments and send a command request to the server.
  * argc, argv: Command-line arguments.
  * Returns 0 on success, negative error code on failure.
  */
@@ -423,7 +452,7 @@ int main(int argc, char **argv)
 	sigemptyset(&sa.sa_mask);
 	sa.sa_flags = 0;
 	if (sigaction(SIGINT, &sa, NULL) == -1) {
-		x_printf(LOG_ERR, "main: sigaction SIGINT: %s", strerror(errno));
+		x_printf(LOG_ERR, "Failed to set SIGINT handler: %s", strerror(errno));
 		return -errno;
 	}
 
@@ -452,13 +481,15 @@ int main(int argc, char **argv)
 			struct passwd *pw = getpwnam(argv[optind + 1]);
 			if (!pw) {
 				fprintf(stderr, "Invalid user: %s\n", argv[optind + 1]);
-				x_printf(LOG_ERR, "main: invalid user '%s'", argv[optind + 1]);
+				x_printf(LOG_ERR, "Invalid user: %s", argv[optind + 1]);
 				return -EINVAL;
 			}
 			target_uid = pw->pw_uid;
+			x_printf(LOG_DEBUG, "Set target user: %s (uid=%u)", argv[optind + 1], target_uid);
 			optind += 2;
 		} else if (strcmp(argv[optind], "-n") == 0) {
 			no_pty = 1;
+			x_printf(LOG_DEBUG, "Disabled PTY usage");
 			optind++;
 		} else if (strcmp(argv[optind], "--help") == 0) {
 			printf("Usage: %s [options] <cmd> <...>\n", argv[0]);
@@ -483,37 +514,38 @@ int main(int argc, char **argv)
 	list.argc = argc - optind;
 	memcpy(list.argv, argv + optind, sizeof(char *) * list.argc);
 
-	/* 获取当前工作目录 */
+	/* Retrieve current working directory */
 	char cwd_buf[CSDO_CWD_MAX] = {};
 	if (getcwd(cwd_buf, sizeof(cwd_buf)) == NULL) {
-		x_printf(LOG_ERR, "main: getcwd failed: %s", strerror(errno));
+		x_printf(LOG_ERR, "Failed to get current working directory: %s", strerror(errno));
 		return -errno;
 	}
 	list.cwd = cwd_buf;
-	x_printf(LOG_DEBUG, "main: cwd='%s'", list.cwd);
+	x_printf(LOG_DEBUG, "Current working directory: %s", list.cwd);
 
 	uint32_t size = 0;
 	if (cmd_encode(&list, NULL, &size)) {
-		x_printf(LOG_ERR, "main: cmd_encode failed for command '%s'", argv[optind]);
+		x_printf(LOG_ERR, "Failed to encode command '%s'", argv[optind]);
 		return -EINVAL;
 	}
 	if (size == 0) {
-		x_printf(LOG_ERR, "main: cmd_encode returned zero size for command '%s'", argv[optind]);
+		x_printf(LOG_ERR, "Command encoding returned zero size for '%s'", argv[optind]);
 		return -EINVAL;
 	}
 	char *data = malloc(size);
 	if (!data) {
-		x_printf(LOG_ERR, "main: malloc failed for %u bytes", size);
+		x_printf(LOG_ERR, "Failed to allocate memory for command encoding: size=%u", size);
 		return -ENOMEM;
 	}
 	if (cmd_encode(&list, data, &size) || size == 0) {
-		x_printf(LOG_ERR, "main: cmd_encode failed for command '%s'", argv[optind]);
+		x_printf(LOG_ERR, "Failed to encode command '%s'", argv[optind]);
 		free(data);
 		return -EINVAL;
 	}
-	x_printf(LOG_DEBUG, "main: encoded command '%s', size=%u", argv[optind], size);
+	x_printf(LOG_DEBUG, "Encoded command '%s': size=%u", argv[optind], size);
 
 	int res = csdo_query_request(data, size, target_uid, no_pty);
 	free(data);
+	x_printf(LOG_DEBUG, "Command execution completed with result: %d", res);
 	return res;
 }
